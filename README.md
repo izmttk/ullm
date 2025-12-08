@@ -1,6 +1,6 @@
-# Nano-vLLM-X
+# $\mathrm{\mu LLM}$ (micro-LLM)
 
-**Nano vLLM** with Radi**X**-Tree based Cache, and more.
+A lightweight vLLM-like LLM inference engine with radix-tree based KV cache, and more.
 
 该项目受 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm/tree/main) 启发，提供一个从零开始构建的 LLM 推理框架
 
@@ -36,7 +36,7 @@ NOTE: 我发现当 nccl 版本 < 2.27.3 时，分布式环境的销毁会存在�
 
 ```plaintext
 example:
-python -m nanovllmx.entrypoints.openai.api_server --model Qwen3-0.6B --gpu-memory-utilization 0.9 --tp-size 2 --pp-size 2 --context-len 4096 --host 0.0.0.0 --port 8000
+python -m ullm.entrypoints.openai.api_server --model Qwen3-0.6B --gpu-memory-utilization 0.9 --tp-size 2 --pp-size 2 --context-len 4096 --host 0.0.0.0 --port 8000
 
 usage: api_server.py [-h] [--host HOST] [--port PORT] --model MODEL [--gpu-memory-utilization GPU_MEMORY_UTILIZATION] [--max-bs MAX_BS] [--tp-size TP_SIZE] [--pp-size PP_SIZE]
                      [--nccl-port NCCL_PORT] [--device-ids DEVICE_IDS] [--context-len CONTEXT_LEN] [--enforce-eager]

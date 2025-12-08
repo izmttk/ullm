@@ -18,7 +18,7 @@ from .protocol import (
     ModelCard,
     ModelList,
 )
-from nanovllmx.llm import LLM
+from ullm.llm import LLM
 from .serving_chat import OpenAIServingChat
 from .serving_completion import OpenAIServingCompletion
 from ..utils import with_cancellation

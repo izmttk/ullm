@@ -3,8 +3,8 @@ from typing import Union
 
 from fastapi.responses import JSONResponse
 
-from nanovllmx.llm import LLM
-from nanovllmx.core.common import SamplingParams
+from ullm.llm import LLM
+from ullm.core.common import SamplingParams
 from .protocol import (
     ErrorResponse,
     CompletionRequest,
