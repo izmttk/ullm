@@ -94,7 +94,9 @@ class WorkerClient:
     def worker_main_loop(self):
         # Only bind lifecycle for multiprocessing mode
         if not self.use_threading:
-            bind_parent_process_lifecycle(self._worker_loop)()
+            # Wrap the worker loop with lifecycle binding decorator
+            wrapped_loop = bind_parent_process_lifecycle(self._worker_loop)
+            wrapped_loop()
         else:
             self._worker_loop()
     

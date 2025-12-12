@@ -64,7 +64,9 @@ class EngineClient:
     def engine_main_loop(self):
         # Only bind lifecycle for multiprocessing mode
         if not self.use_threading:
-            bind_parent_process_lifecycle(self._engine_loop)()
+            # Wrap the engine loop with lifecycle binding decorator
+            wrapped_loop = bind_parent_process_lifecycle(self._engine_loop)
+            wrapped_loop()
         else:
             self._engine_loop()
     

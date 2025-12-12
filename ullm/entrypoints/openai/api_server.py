@@ -60,6 +60,9 @@ async def lifespan(app: fastapi.FastAPI):
     _engine = engine
 
     # Register signal handlers for graceful shutdown
+    # Note: Using signal.signal() here is simple but not fully thread-safe with asyncio.
+    # For production use, consider using asyncio.add_signal_handler() on Unix systems.
+    # This current approach works for most use cases and is cross-platform compatible.
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
     # On Windows, also handle SIGBREAK if available

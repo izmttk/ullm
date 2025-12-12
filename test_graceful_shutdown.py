@@ -37,7 +37,9 @@ def test_platform_detection():
     
     if sys.platform == "win32":
         print("✓ Running on Windows - threading mode recommended")
-        assert not hasattr(os, 'setsid') or os.name == 'nt', "setsid should not be available on Windows"
+        # On Windows, setsid should either not exist or we should be on Windows (os.name == 'nt')
+        # We check that we're on Windows, which is the main point
+        assert os.name == 'nt', "Windows should report os.name as 'nt'"
     else:
         print("✓ Running on Unix-like system - both modes available")
         assert hasattr(os, 'setsid'), "setsid should be available on Unix"
