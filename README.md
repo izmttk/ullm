@@ -39,7 +39,7 @@ example:
 python -m ullm.entrypoints.openai.api_server --model Qwen3-0.6B --gpu-memory-utilization 0.9 --tp-size 2 --pp-size 2 --context-len 4096 --host 0.0.0.0 --port 8000
 
 usage: api_server.py [-h] [--host HOST] [--port PORT] --model MODEL [--gpu-memory-utilization GPU_MEMORY_UTILIZATION] [--max-bs MAX_BS] [--tp-size TP_SIZE] [--pp-size PP_SIZE]
-                     [--nccl-port NCCL_PORT] [--device-ids DEVICE_IDS] [--context-len CONTEXT_LEN] [--enforce-eager]
+                     [--nccl-port NCCL_PORT] [--device-ids DEVICE_IDS] [--context-len CONTEXT_LEN] [--enforce-eager] [--use-threading]
 
 LLM Distributed OpenAI-Compatible API Server
 
@@ -60,6 +60,7 @@ options:
   --context-len CONTEXT_LEN
                         Max context length of the model
   --enforce-eager       Enforce eager execution, disable CUDA graph
+  --use-threading       Use threading instead of multiprocessing (recommended for Windows)
 ```
 
 Offline Inference
@@ -99,9 +100,26 @@ Results:
 | vLLM v0.11.0     | 133966        | 18.24    |  7343.96              |
 | ours             | 133966        | 14.83    |  9032.37              |
 
+## Windows Support
+
+该项目现在支持 Windows 平台！在 Windows 上运行时，推荐使用 `--use-threading` 选项以获得更好的兼容性：
+
+```plaintext
+python -m ullm.entrypoints.openai.api_server --model Qwen3-0.6B --use-threading --tp-size 1 --pp-size 1
+```
+
+注意：在 Windows 上使用多进程模式可能会遇到兼容性问题，建议使用线程模式（`--use-threading`）。
+
+## Graceful Shutdown
+
+该项目现已支持优雅关闭（Graceful Shutdown）：
+
+- 使用 `Ctrl+C` (SIGINT) 或 `SIGTERM` 信号可以优雅地关闭服务器
+- 所有工作进程/线程会正确清理资源并退出
+- 支持在 Linux 和 Windows 平台上优雅关闭
+
 ## TODO
 
-- Graceful Shutdown
 - Better Logging System
 - Benchmark Metrics on API Server
 - More Configurable Options

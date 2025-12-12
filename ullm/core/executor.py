@@ -16,11 +16,13 @@ class Executor:
         device_ids: list[int] | None = None,
         enforce_eager: bool = False,
         context_len: int = 2048,
+        use_threading: bool = False,
     ):
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.nccl_port = nccl_port
         self.device_ids = device_ids
+        self.use_threading = use_threading
         
         assert device_ids is None or len(device_ids) == tp_size * pp_size , \
             "device_ids should have the same length as tp_size * pp_size"
@@ -43,6 +45,7 @@ class Executor:
                     is_driver_worker=is_driver_worker,
                     enforce_eager=enforce_eager,
                     context_len=context_len,
+                    use_threading=use_threading,
                 )
                 if is_driver_worker:
                     self.driver_worker = worker
@@ -78,7 +81,10 @@ class Executor:
             worker.shutdown()
         for worker in self.workers:
             worker.join()
-        self.driver_worker.output_queue.put_nowait("shutdown")
+        if self.use_threading:
+            self.driver_worker.output_queue.put("shutdown")
+        else:
+            self.driver_worker.output_queue.put_nowait("shutdown")
         self.collect_thread.join()
 
         print("Executor has been shut down.")

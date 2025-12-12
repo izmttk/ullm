@@ -8,13 +8,17 @@ import functools
 import traceback
 
 def kill_itself_when_parent_died():
+    """Set up process to be killed when parent dies (Linux only)."""
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies  
         PR_SET_PDEATHSIG = 1
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-    else:
-        print("kill_itself_when_parent_died is only supported in linux.")
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        except Exception as e:
+            print(f"Warning: Failed to set PR_SET_PDEATHSIG: {e}")
+    # On Windows and other platforms, this functionality is not available
+    # but the process lifecycle is still managed through other mechanisms
 
 def kill_process_tree(parent_pid = None, include_parent: bool = True, skip_pid: int | None = None):
     """Kill the process and all its child processes."""
@@ -68,12 +72,22 @@ def bind_parent_process_lifecycle(func):
         
         def _handle_exit(signum, frame):
             # 函数执行出错时，通知父进程并杀死自己
-            parent_process.send_signal(signal.SIGTERM)
-            sys.exit(128 + signum)
+            try:
+                if sys.platform == "win32":
+                    # On Windows, SIGTERM might not be available, use terminate()
+                    parent_process.terminate()
+                else:
+                    parent_process.send_signal(signal.SIGTERM)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass  # Parent already dead or no permission
+            sys.exit(128 + signum if signum else 1)
 
         # 注册信号处理器
+        # On Windows, only SIGINT and SIGBREAK are supported
         signal.signal(signal.SIGTERM, _handle_exit)
         signal.signal(signal.SIGINT,  _handle_exit)
+        if sys.platform == "win32" and hasattr(signal, 'SIGBREAK'):
+            signal.signal(signal.SIGBREAK, _handle_exit)  # type: ignore
         
         try:
             return func(*args, **kwargs)

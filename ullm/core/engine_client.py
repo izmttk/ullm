@@ -1,8 +1,11 @@
 from .engine import Engine, EngineOutput
 from .common import SamplingParams
 import torch.multiprocessing as mp
+import threading
+import queue
 from ..utils import bind_parent_process_lifecycle
 import os
+import sys
 
 class EngineClient:
     def __init__(
@@ -16,6 +19,7 @@ class EngineClient:
         device_ids: list[int] | None = None,
         enforce_eager: bool = False,
         context_len: int = 2048,
+        use_threading: bool = False,
     ):
         self.model = model
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -26,25 +30,48 @@ class EngineClient:
         self.device_ids = device_ids
         self.enforce_eager = enforce_eager
         self.context_len = context_len
+        self.use_threading = use_threading
         
-        self.mp_ctx = mp.get_context('spawn')
-        self.input_queue = self.mp_ctx.Queue()
-        self.output_queue = self.mp_ctx.Queue()
-        
-        self.ready_event = self.mp_ctx.Event()
+        if use_threading:
+            # Use threading mode (for Windows or single-GPU setups)
+            self.input_queue = queue.Queue()  # type: ignore
+            self.output_queue = queue.Queue()  # type: ignore
+            self.ready_event = threading.Event()  # type: ignore
+        else:
+            # Use multiprocessing mode (default)
+            self.mp_ctx = mp.get_context('spawn')
+            self.input_queue = self.mp_ctx.Queue()  # type: ignore
+            self.output_queue = self.mp_ctx.Queue()  # type: ignore
+            self.ready_event = self.mp_ctx.Event()  # type: ignore
         
         self.init_process()
 
     def init_process(self):
-        self.engine_process = self.mp_ctx.Process(
-            target=self.engine_main_loop,
-            name=f"engine",
-        )
-        self.engine_process.start()
+        if self.use_threading:
+            self.engine_thread = threading.Thread(
+                target=self.engine_main_loop,
+                name="engine",
+                daemon=False,
+            )
+            self.engine_thread.start()
+        else:
+            self.engine_process = mp.get_context('spawn').Process(
+                target=self.engine_main_loop,
+                name=f"engine",
+            )
+            self.engine_process.start()
 
-    @bind_parent_process_lifecycle
     def engine_main_loop(self):
-        os.setsid()  # 使子进程成为新会话的首进程，防止收到来自终端的信号
+        # Only bind lifecycle for multiprocessing mode
+        if not self.use_threading:
+            bind_parent_process_lifecycle(lambda: self._engine_loop())()
+        else:
+            self._engine_loop()
+    
+    def _engine_loop(self):
+        # Make child process session leader to avoid terminal signals (Linux only)
+        if not self.use_threading and sys.platform != "win32" and hasattr(os, 'setsid'):
+            os.setsid()
         engine = Engine(
             model=self.model,
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -55,6 +82,7 @@ class EngineClient:
             device_ids=self.device_ids,
             enforce_eager=self.enforce_eager,
             context_len=self.context_len,
+            use_threading=self.use_threading,
         )
         engine.wait_until_ready()
         self.ready_event.set()
@@ -92,17 +120,27 @@ class EngineClient:
             
             outputs = engine.step()
             if outputs:
-                self.output_queue.put_nowait(outputs)
+                if self.use_threading:
+                    self.output_queue.put(outputs)
+                else:
+                    self.output_queue.put_nowait(outputs)
 
-        self.output_queue.put_nowait(None)
+        if self.use_threading:
+            self.output_queue.put(None)
+        else:
+            self.output_queue.put_nowait(None)
         engine.shutdown()
     
     def wait_until_ready(self):
         self.ready_event.wait()
 
     def shutdown(self):
-        self.input_queue.put_nowait(("shutdown",))
-        self.engine_process.join()
+        if self.use_threading:
+            self.input_queue.put(("shutdown",))
+            self.engine_thread.join()
+        else:
+            self.input_queue.put_nowait(("shutdown",))
+            self.engine_process.join()
         print("Engine has been shut down.")
 
     def add_sequence(
@@ -111,12 +149,16 @@ class EngineClient:
         prompt_token_ids: list[int],
         sampling_params: SamplingParams
     ):
-        self.input_queue.put_nowait(
-            ("add", sequence_id, prompt_token_ids, sampling_params)
-        )
+        if self.use_threading:
+            self.input_queue.put(("add", sequence_id, prompt_token_ids, sampling_params))
+        else:
+            self.input_queue.put_nowait(("add", sequence_id, prompt_token_ids, sampling_params))
 
     def get_output(self) -> list[EngineOutput]:
         return self.output_queue.get()
 
     def abort_sequence(self, sequence_id: str):
-        self.input_queue.put_nowait(("abort", sequence_id))
+        if self.use_threading:
+            self.input_queue.put(("abort", sequence_id))
+        else:
+            self.input_queue.put_nowait(("abort", sequence_id))

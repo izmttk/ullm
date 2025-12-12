@@ -21,6 +21,7 @@ class Engine:
         device_ids: list[int] | None = None,
         enforce_eager: bool = False,
         context_len: int = 2048,
+        use_threading: bool = False,
     ):
         self.context_len = context_len
         self.model_executor = Executor(
@@ -32,6 +33,7 @@ class Engine:
             device_ids=device_ids,
             enforce_eager=enforce_eager,
             context_len=context_len,
+            use_threading=use_threading,
         )
         
         kv_cache_size = self.model_executor.profile_kv_cache_size(gpu_memory_utilization)

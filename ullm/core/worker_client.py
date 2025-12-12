@@ -1,6 +1,8 @@
 from typing import Optional
 from .worker import Worker
 import torch.multiprocessing as mp
+import threading
+import queue
 from ..utils import bind_parent_process_lifecycle
 
 class WorkerClient:
@@ -16,6 +18,7 @@ class WorkerClient:
         is_driver_worker = False,
         enforce_eager: bool = False,
         context_len: int = 2048,
+        use_threading: bool = False,
     ):
         self.model = model
         self.max_bs = max_bs
@@ -32,39 +35,70 @@ class WorkerClient:
         self.is_driver_worker = is_driver_worker
         self.enforce_eager = enforce_eager
         self.context_len = context_len
+        self.use_threading = use_threading
         self.methods = {}  # 用于存储注册的方法
         
+        if use_threading:
+            # Use threading mode (for Windows or single-GPU setups)
+            self.input_queue = queue.Queue()  # type: ignore
+            self.output_queue = queue.Queue()  # type: ignore
+            self.ready_event = threading.Event()  # type: ignore
+        else:
+            # Use multiprocessing mode (default)
+            self.mp_ctx = mp.get_context('spawn')
+            self.input_queue = self.mp_ctx.Queue()  # type: ignore
+            self.output_queue = self.mp_ctx.Queue()  # type: ignore
+            self.ready_event = self.mp_ctx.Event()  # type: ignore
         
-        self.mp_ctx = mp.get_context('spawn')
-        self.input_queue = self.mp_ctx.Queue()
-        self.output_queue = self.mp_ctx.Queue()
-        self.ready_event = self.mp_ctx.Event()
         self.init_worker()
 
     def init_worker(self):
-        self.worker_process = self.mp_ctx.Process(
-            target=self.worker_main_loop,
-            name=f"worker-{self.rank}",
-        )
-        self.worker_process.start()
+        if self.use_threading:
+            self.worker_thread = threading.Thread(
+                target=self.worker_main_loop,
+                name=f"worker-{self.rank}",
+                daemon=False,
+            )
+            self.worker_thread.start()
+        else:
+            self.worker_process = mp.get_context('spawn').Process(
+                target=self.worker_main_loop,
+                name=f"worker-{self.rank}",
+            )
+            self.worker_process.start()
 
     def send_request(self, request_id: str, data: dict):
-        self.input_queue.put_nowait((request_id, data))
+        if self.use_threading:
+            self.input_queue.put((request_id, data))
+        else:
+            self.input_queue.put_nowait((request_id, data))
 
     def recv_response(self, timeout: Optional[float] = None):
         return self.output_queue.get(timeout=timeout)
     
     def shutdown(self):
-        self.input_queue.put_nowait('shutdown')
+        if self.use_threading:
+            self.input_queue.put('shutdown')
+        else:
+            self.input_queue.put_nowait('shutdown')
     
     def join(self):
-        self.worker_process.join()
+        if self.use_threading:
+            self.worker_thread.join()
+        else:
+            self.worker_process.join()
     
     def wait_until_ready(self, timeout: Optional[float] = None):
         self.ready_event.wait(timeout=timeout)
 
-    @bind_parent_process_lifecycle
     def worker_main_loop(self):
+        # Only bind lifecycle for multiprocessing mode
+        if not self.use_threading:
+            bind_parent_process_lifecycle(lambda: self._worker_loop())()
+        else:
+            self._worker_loop()
+    
+    def _worker_loop(self):
         worker = Worker(
             model=self.model,
             max_bs=self.max_bs,
@@ -91,7 +125,10 @@ class WorkerClient:
             request_id, data = msg
             response = self.handle_request(data)  # 处理请求
             if self.is_driver_worker:
-                self.output_queue.put_nowait((request_id, response))
+                if self.use_threading:
+                    self.output_queue.put((request_id, response))
+                else:
+                    self.output_queue.put_nowait((request_id, response))
         worker.destroy_environment()
         print(f"Worker {self.rank} has shut down.")
 

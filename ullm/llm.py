@@ -25,6 +25,7 @@ class LLM:
         device_ids: list[int] | None = None,
         enforce_eager: bool = False,
         context_len: int = 2048,
+        use_threading: bool = False,
     ):
         self.engine = EngineClient(
             model,
@@ -36,6 +37,7 @@ class LLM:
             device_ids,
             enforce_eager,
             context_len,
+            use_threading,
         )
     
         self.tokenizer = init_tokenizer(model)

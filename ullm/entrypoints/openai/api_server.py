@@ -5,6 +5,8 @@ https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/api_serve
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
+import signal
+import sys
 import uvicorn
 import fastapi
 from fastapi.exceptions import RequestValidationError
@@ -25,9 +27,22 @@ from ..utils import with_cancellation
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
+# Global engine reference for signal handler
+_engine = None
+
+
+def _signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global _engine
+    print(f"\nReceived signal {signum}, shutting down gracefully...")
+    if _engine is not None:
+        _engine.shutdown()
+    sys.exit(0)
+
 
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
+    global _engine
     device_ids = [int(i) for i in args.device_ids.split(",")] if args.device_ids else None
     engine = LLM(
         model=args.model,
@@ -39,8 +54,14 @@ async def lifespan(app: fastapi.FastAPI):
         device_ids=device_ids,
         enforce_eager=args.enforce_eager,
         context_len=args.context_len,
+        use_threading=args.use_threading,
     )
     await engine.ready()
+    _engine = engine
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     app.state.model_name = args.model
     app.state.serving_chat = OpenAIServingChat(engine, args.model)
@@ -48,7 +69,9 @@ async def lifespan(app: fastapi.FastAPI):
     
     yield
     
+    print("Shutting down engine...")
     engine.shutdown()
+    _engine = None
 
 app = fastapi.FastAPI(lifespan=lifespan)
 
@@ -131,6 +154,11 @@ if __name__ == "__main__":
         "--enforce-eager",
         action="store_true",
         help="Enforce eager execution, disable CUDA graph",
+    )
+    parser.add_argument(
+        "--use-threading",
+        action="store_true",
+        help="Use threading instead of multiprocessing (recommended for Windows)",
     )
     args = parser.parse_args()
     
