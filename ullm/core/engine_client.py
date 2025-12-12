@@ -55,7 +55,7 @@ class EngineClient:
             )
             self.engine_thread.start()
         else:
-            self.engine_process = mp.get_context('spawn').Process(
+            self.engine_process = self.mp_ctx.Process(
                 target=self.engine_main_loop,
                 name=f"engine",
             )

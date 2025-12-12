@@ -61,7 +61,7 @@ class WorkerClient:
             )
             self.worker_thread.start()
         else:
-            self.worker_process = mp.get_context('spawn').Process(
+            self.worker_process = self.mp_ctx.Process(
                 target=self.worker_main_loop,
                 name=f"worker-{self.rank}",
             )

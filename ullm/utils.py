@@ -83,11 +83,15 @@ def bind_parent_process_lifecycle(func):
             sys.exit(128 + signum if signum else 1)
 
         # 注册信号处理器
-        # On Windows, only SIGINT and SIGBREAK are supported
-        signal.signal(signal.SIGTERM, _handle_exit)
-        signal.signal(signal.SIGINT,  _handle_exit)
+        # On Windows, only SIGINT and SIGBREAK are supported; SIGTERM is not available
+        if sys.platform != "win32":
+            signal.signal(signal.SIGTERM, _handle_exit)
+        signal.signal(signal.SIGINT, _handle_exit)
         if sys.platform == "win32":
-            signal.signal(signal.SIGBREAK, _handle_exit)  # type: ignore
+            try:
+                signal.signal(signal.SIGBREAK, _handle_exit)  # type: ignore
+            except AttributeError:
+                pass  # SIGBREAK not available in this Python build
         
         try:
             return func(*args, **kwargs)
