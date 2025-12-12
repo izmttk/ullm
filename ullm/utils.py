@@ -86,7 +86,7 @@ def bind_parent_process_lifecycle(func):
         # On Windows, only SIGINT and SIGBREAK are supported
         signal.signal(signal.SIGTERM, _handle_exit)
         signal.signal(signal.SIGINT,  _handle_exit)
-        if sys.platform == "win32" and hasattr(signal, 'SIGBREAK'):
+        if sys.platform == "win32":
             signal.signal(signal.SIGBREAK, _handle_exit)  # type: ignore
         
         try:

@@ -62,6 +62,9 @@ async def lifespan(app: fastapi.FastAPI):
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    # On Windows, also handle SIGBREAK
+    if sys.platform == "win32" and hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, _signal_handler)  # type: ignore
 
     app.state.model_name = args.model
     app.state.serving_chat = OpenAIServingChat(engine, args.model)
