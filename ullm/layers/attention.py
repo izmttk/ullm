@@ -49,13 +49,11 @@ class AttentionBackend:
         self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",
-            backend="auto",
         )
         self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",
             use_tensor_cores=False,
-            backend="auto",
         )
         self.decode_wrappers_cuda_graph: dict[int, BatchDecodeWithPagedKVCacheWrapper] = {}
 
@@ -189,7 +187,6 @@ class AttentionBackend:
             "NHD",
             use_tensor_cores=False,
             use_cuda_graph=True,
-            backend="auto",
             paged_kv_indptr_buffer=paged_kv_indptr,
             paged_kv_indices_buffer=paged_kv_indices,
             paged_kv_last_page_len_buffer=paged_kv_last_page_len

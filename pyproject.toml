@@ -16,6 +16,7 @@ dependencies = [
     "triton>=3.0.0",
     "transformers>=4.51.0",
     "fastapi>=0.95.0",
+    "uvicorn",
     "flashinfer-python>=0.2.0",
     "psutil",
 ]
