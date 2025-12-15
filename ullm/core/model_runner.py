@@ -76,6 +76,43 @@ class ModelRunner:
         self.context_len = context_len
         set_cuda_arch()
     
+    def initialize(self, gpu_memory_utilization: float = 0.9):
+        # Initialize Model
+        self.load_model()
+
+        # Initialize KV Cache
+        kv_cache_size = self.profile_kv_cache_size(gpu_memory_utilization)
+        if self.rank == 0:
+            print(f"Max num tokens in kv cache: {kv_cache_size}")
+        self.kv_cache_size = kv_cache_size
+        self.kv_cache = KVCachePool(
+            dtype=self.dtype,
+            device=self.device,
+            num_tokens=self.kv_cache_size,
+            num_layers=self.num_layers,
+            num_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+        )
+
+        # Initialize Attention Backend
+        self.attn_backend = AttentionBackend(
+            kv_cache=self.kv_cache,
+            num_qo_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        # Initialize CUDA Graph
+        if not self.enforce_eager:
+            self.cuda_graph = CUDAGraph()
+            self.capture_graph()
+        else:
+            self.cuda_graph = None  
+      
     def load_model(self):
         
         hf_config = AutoConfig.from_pretrained(
@@ -129,32 +166,6 @@ class ModelRunner:
         load_model(self.model, self.model_path)
         
         torch.set_default_dtype(torch_default_dtype)
-
-    def initialize_kv_cache(self, kv_cache_size: int):
-        self.kv_cache_size = kv_cache_size
-        self.kv_cache = KVCachePool(
-            dtype=self.dtype,
-            device=self.device,
-            num_tokens=self.kv_cache_size,
-            num_layers=self.num_layers,
-            num_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
-        )
-        self.attn_backend = AttentionBackend(
-            kv_cache=self.kv_cache,
-            num_qo_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        if not self.enforce_eager:
-            self.cuda_graph = CUDAGraph()
-            self.capture_graph()
-        else:
-            self.cuda_graph = None
 
     def profile_kv_cache_size(self, gpu_memory_utilization: float = 0.9):
         cache_memsize_per_token = self.num_layers * self.num_kv_heads * self.head_dim * 2 * self.dtype.itemsize

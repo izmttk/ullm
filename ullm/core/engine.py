@@ -33,11 +33,8 @@ class Engine:
             enforce_eager=enforce_eager,
             context_len=context_len,
         )
-        
-        kv_cache_size = self.model_executor.profile_kv_cache_size(gpu_memory_utilization)
-        print(f"Max num tokens in kv cache: {kv_cache_size}")
-        self.model_executor.initialize_kv_cache(kv_cache_size)
-
+        self.model_executor.initialize(gpu_memory_utilization)
+        kv_cache_size = self.model_executor.get_kv_cache_size()
         self.scheduler = Scheduler(
             kv_cache_size=kv_cache_size,
             max_bs=max_bs
@@ -152,9 +149,6 @@ class Engine:
             return True, FinishReason.LENGTH
         
         return False, None
-    
-    def wait_until_ready(self):
-        self.model_executor.wait_until_ready()
 
     def shutdown(self):
         self.model_executor.shutdown()

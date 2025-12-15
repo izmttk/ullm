@@ -78,8 +78,8 @@ class Worker:
         destroy_distributed_environment()
         print(f"Worker {self.rank} destroyed its environment.")
 
-    def load_model(self):
-        self.model_runner.load_model()
+    def initialize(self, gpu_memory_utilization: float):
+        self.model_runner.initialize(gpu_memory_utilization)
 
     def execute_model(self, batch: ForwardBatch) -> list[int] | None:
         intermediate_tensors = None
@@ -103,8 +103,6 @@ class Worker:
         assert isinstance(output, torch.Tensor)
         return output.tolist()
 
-    def initialize_kv_cache(self, kv_cache_size: int):
-        self.model_runner.initialize_kv_cache(kv_cache_size)
-    
-    def profile_kv_cache_size(self, gpu_memory_utilization: float):
-        return self.model_runner.profile_kv_cache_size(gpu_memory_utilization)
+    def get_kv_cache_size(self) -> int:
+        assert hasattr(self.model_runner, "kv_cache_size"), "Initialize Worker before calling this function."
+        return self.model_runner.kv_cache_size

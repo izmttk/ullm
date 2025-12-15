@@ -69,10 +69,6 @@ class Executor:
                     future.set_exception(Exception(data['error']))
         print("Executor stopped response collection.")
 
-    def wait_until_ready(self):
-        for worker in self.workers:
-            worker.wait_until_ready()
-
     def shutdown(self):
         for worker in self.workers:
             worker.shutdown()
@@ -98,9 +94,9 @@ class Executor:
 
     def execute_model(self, batch: ForwardBatch) -> Future[list[int]]:
         return self.submit("execute_model", batch)
-    
-    def initialize_kv_cache(self, kv_cache_size: int):
-        self.submit("initialize_kv_cache", kv_cache_size).result()
 
-    def profile_kv_cache_size(self, gpu_memory_utilization: float) -> int:
-        return self.submit("profile_kv_cache_size", gpu_memory_utilization).result()
+    def initialize(self, gpu_memory_utilization: float):
+        self.submit("initialize", gpu_memory_utilization).result()
+
+    def get_kv_cache_size(self) -> int:
+        return self.submit("get_kv_cache_size").result()

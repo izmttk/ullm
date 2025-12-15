@@ -56,7 +56,6 @@ class EngineClient:
             enforce_eager=self.enforce_eager,
             context_len=self.context_len,
         )
-        engine.wait_until_ready()
         self.ready_event.set()
         
         while True:

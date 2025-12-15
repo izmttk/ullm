@@ -31,14 +31,11 @@ class WorkerClient:
         
         self.is_driver_worker = is_driver_worker
         self.enforce_eager = enforce_eager
-        self.context_len = context_len
-        self.methods = {}  # 用于存储注册的方法
-        
+        self.context_len = context_len        
         
         self.mp_ctx = mp.get_context('spawn')
         self.input_queue = self.mp_ctx.Queue()
         self.output_queue = self.mp_ctx.Queue()
-        self.ready_event = self.mp_ctx.Event()
         self.init_worker()
 
     def init_worker(self):
@@ -59,9 +56,6 @@ class WorkerClient:
     
     def join(self):
         self.worker_process.join()
-    
-    def wait_until_ready(self, timeout: Optional[float] = None):
-        self.ready_event.wait(timeout=timeout)
 
     @bind_parent_process_lifecycle
     def worker_main_loop(self):
@@ -77,32 +71,27 @@ class WorkerClient:
             context_len=self.context_len,
         )
         worker.init_environment()
-        worker.load_model()
         
-        self.methods["execute_model"] = worker.execute_model
-        self.methods["initialize_kv_cache"] = worker.initialize_kv_cache
-        self.methods["profile_kv_cache_size"] = worker.profile_kv_cache_size
-        
-        self.ready_event.set()
         while True:
             msg = self.input_queue.get()  # 等待输入
             if msg == 'shutdown':
                 break
             request_id, data = msg
-            response = self.handle_request(data)  # 处理请求
+            response = self.handle_request(worker, data)  # 处理请求
             if self.is_driver_worker:
                 self.output_queue.put_nowait((request_id, response))
         worker.destroy_environment()
         print(f"Worker {self.rank} has shut down.")
 
-    def handle_request(self, request):
+    def handle_request(self, worker: Worker, request: dict):
         """处理单个请求"""
-        method_name = request['method']
+        method_name = request.get('method', None)
         args = request.get('args', tuple())
         kwargs = request.get('kwargs', dict())
         # 查找并调用注册的方法
-        if method_name in self.methods:
-            method = self.methods[method_name]
+        method = getattr(worker, method_name, None) if method_name else None
+        method = method if callable(method) else None
+        if method:
             # 执行方法
             result = method(*args, **kwargs)
             
