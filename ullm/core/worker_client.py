@@ -2,6 +2,7 @@ from typing import Optional
 from .worker import Worker
 import torch.multiprocessing as mp
 from ..utils import bind_parent_process_lifecycle
+import queue
 
 class WorkerClient:
     def __init__(
@@ -36,6 +37,8 @@ class WorkerClient:
         self.mp_ctx = mp.get_context('spawn')
         self.input_queue = self.mp_ctx.Queue()
         self.output_queue = self.mp_ctx.Queue()
+
+        self.shutdown_event = self.mp_ctx.Event()
         self.init_worker()
 
     def init_worker(self):
@@ -45,14 +48,14 @@ class WorkerClient:
         )
         self.worker_process.start()
 
-    def send_request(self, request_id: str, data: dict):
-        self.input_queue.put_nowait((request_id, data))
+    def send_request(self, request_id: str, method: str, *args, **kwargs):
+        self.input_queue.put_nowait((request_id, method, args, kwargs))
 
     def recv_response(self, timeout: Optional[float] = None):
         return self.output_queue.get(timeout=timeout)
     
     def shutdown(self):
-        self.input_queue.put_nowait('shutdown')
+        self.shutdown_event.set()
     
     def join(self):
         self.worker_process.join()
@@ -70,39 +73,30 @@ class WorkerClient:
             enforce_eager=self.enforce_eager,
             context_len=self.context_len,
         )
-        worker.init_environment()
-        
-        while True:
-            msg = self.input_queue.get()  # 等待输入
-            if msg == 'shutdown':
-                break
-            request_id, data = msg
-            response = self.handle_request(worker, data)  # 处理请求
-            if self.is_driver_worker:
-                self.output_queue.put_nowait((request_id, response))
-        worker.destroy_environment()
-        print(f"Worker {self.rank} has shut down.")
+        try:
+            worker.init_environment()
+            while not self.shutdown_event.is_set():
+                try:
+                    msg = self.input_queue.get(timeout=0.1)  # 等待输入
+                except queue.Empty:
+                    continue
+                request_id, method_name, args, kwargs = msg
+                response = self.handle_request(worker, method_name, *args, **kwargs)  # 处理请求
+                if self.is_driver_worker:
+                    self.output_queue.put_nowait((request_id, response))
+        finally:
+            worker.destroy_environment()
+            print(f"Worker {self.rank} has shut down.")
 
-    def handle_request(self, worker: Worker, request: dict):
-        """处理单个请求"""
-        method_name = request.get('method', None)
-        args = request.get('args', tuple())
-        kwargs = request.get('kwargs', dict())
+    def handle_request(self, worker: Worker, method_name: str, *args, **kwargs):
         # 查找并调用注册的方法
         method = getattr(worker, method_name, None) if method_name else None
         method = method if callable(method) else None
         if method:
             # 执行方法
             result = method(*args, **kwargs)
-            
             # 返回成功结果
-            return {
-                'status': 'success',
-                'result': result
-            }
+            return ('success', result)
         else:
             # 方法不存在
-            return {
-                'status': 'error',
-                'error': f"Method '{method_name}' not found"
-            }
+            return ('failed', f"Method '{method_name}' not found")

@@ -4,6 +4,7 @@ from .core.common import SamplingParams, GenerateOutput
 import asyncio
 from transformers import AutoTokenizer, PreTrainedTokenizer
 import uuid
+import queue
 
 def init_tokenizer(model: str) -> PreTrainedTokenizer:
     tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False, trust_remote_code=True)
@@ -39,16 +40,16 @@ class LLM:
         )
     
         self.tokenizer = init_tokenizer(model)
-        self.event_loop = asyncio.get_event_loop()
 
         self.request_states: dict[str, asyncio.Queue[GenerateOutput | None]] = {}
         self.output_processor_task = asyncio.create_task(self.output_processor())
 
     async def output_processor(self):
         while True:
-            outputs = await self.event_loop.run_in_executor(None, self.engine.get_output)
-            if outputs is None: # Shutdown signal
-                break
+            try:
+                outputs = await asyncio.to_thread(self.engine.get_output, timeout=0.1)
+            except queue.Empty:
+                continue
             for output in outputs:
                 seq_id = output.seq_id
                 new_token_id = output.new_token_id
@@ -81,7 +82,7 @@ class LLM:
         return self.tokenizer.batch_decode(token_ids, skip_special_tokens=True)
     
     async def ready(self):
-        await self.event_loop.run_in_executor(None, self.engine.wait_until_ready)
+        await asyncio.to_thread(self.engine.wait_until_ready)
     
     async def generate(
         self,
@@ -127,5 +128,5 @@ class LLM:
             del self.request_states[sequence_id]
 
     def shutdown(self):
-        self.engine.shutdown()
         self.output_processor_task.cancel()
+        self.engine.shutdown()

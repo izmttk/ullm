@@ -4,6 +4,7 @@ import threading
 from concurrent.futures import Future
 from .worker_client import WorkerClient
 from .common import ForwardBatch
+import queue
 
 class Executor:
     def __init__(
@@ -26,6 +27,8 @@ class Executor:
             "device_ids should have the same length as tp_size * pp_size"
         if device_ids is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, device_ids))
+
+        self.shutdown_event = threading.Event()
 
         self.workers: list[WorkerClient] = []
         self.driver_worker: WorkerClient
@@ -55,40 +58,35 @@ class Executor:
         self.collect_thread.start()
 
     def _collect_loop(self):
-        while True:
-            msg = self.driver_worker.recv_response()
-            if msg == "shutdown":
-                break
+        while not self.shutdown_event.is_set():
+            try:
+                msg = self.driver_worker.recv_response(timeout=0.1)
+            except queue.Empty:
+                continue
             request_id, data = msg
             future = self.pending.pop(request_id, None)
             if future:
-                assert isinstance(data, dict)
-                if data['status'] == 'success':
-                    future.set_result(data['result'])
+                status, result = data
+                if status == 'success':
+                    future.set_result(result)
                 else:
-                    future.set_exception(Exception(data['error']))
+                    future.set_exception(Exception(result))
         print("Executor stopped response collection.")
 
     def shutdown(self):
+        self.shutdown_event.set()
+        self.collect_thread.join()
         for worker in self.workers:
             worker.shutdown()
         for worker in self.workers:
             worker.join()
-        self.driver_worker.output_queue.put_nowait("shutdown")
-        self.collect_thread.join()
-
         print("Executor has been shut down.")
 
     def submit(self, method, *args, **kwargs):
         future = Future()
         request_id = uuid.uuid4().hex
-        request = {
-            'method': method,
-            'args': args,
-            'kwargs': kwargs
-        }
         for worker in self.workers:
-            worker.send_request(request_id, request)
+            worker.send_request(request_id, method, *args, **kwargs)
         self.pending[request_id] = future
         return future
 

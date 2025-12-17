@@ -3,6 +3,7 @@ from .common import SamplingParams
 import torch.multiprocessing as mp
 from ..utils import bind_parent_process_lifecycle
 import os
+import queue
 
 class EngineClient:
     def __init__(
@@ -32,6 +33,7 @@ class EngineClient:
         self.output_queue = self.mp_ctx.Queue()
         
         self.ready_event = self.mp_ctx.Event()
+        self.shutdown_event = self.mp_ctx.Event()
         
         self.init_process()
 
@@ -56,51 +58,47 @@ class EngineClient:
             enforce_eager=self.enforce_eager,
             context_len=self.context_len,
         )
-        self.ready_event.set()
-        
-        while True:
-            is_shutdown = False
-            # 如果 engine 中没有未完成的请求了，即 engine 的 waiting 和 running 队列都空了
-            # 则在调用下一次 step 之前，阻塞等待一个新的请求
-            if not engine.has_unfinished_sequences():
-                method, *params = self.input_queue.get()
-                if method == "shutdown":
-                    is_shutdown = True
-                elif method == "abort":
-                    engine.abort_sequence(*params)
-                elif method == "add":
-                    engine.add_sequence(*params)
-                else:
-                    raise ValueError(f"Unknown method: {method}")
-            
-            # 其他情况下，即存在未完成的请求，则需要继续调用 step
-            while not self.input_queue.empty():
-                method, *params = self.input_queue.get()
-                if method == "shutdown":
-                    is_shutdown = True
-                    break
-                elif method == "abort":
-                    engine.abort_sequence(*params)
-                elif method == "add":
-                    engine.add_sequence(*params)
-                else:
-                    raise ValueError(f"Unknown method: {method}")
+        try:
+            self.ready_event.set()
+            while not self.shutdown_event.is_set():
+                # 如果 engine 中没有未完成的请求了，即 engine 的 waiting 和 running 队列都空了
+                # 则在调用下一次 step 之前，阻塞等待一个新的请求
+                if not engine.has_unfinished_sequences():
+                    try:
+                        method_name, args, kwargs = self.input_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    method = getattr(engine, method_name, None) if method_name else None
+                    method = method if callable(method) else None
+                    if method:
+                        method(*args, **kwargs)
+                    else:
+                        raise ValueError(f"Unknown method: {method_name}")
+                
+                # 其他情况下，即存在未完成的请求，则需要继续调用 step
+                while not self.input_queue.empty() and not self.shutdown_event.is_set():
+                    method_name, args, kwargs = self.input_queue.get_nowait()
+                    method = getattr(engine, method_name, None) if method_name else None
+                    method = method if callable(method) else None
+                    if method:
+                        method(*args, **kwargs)
+                    else:
+                        raise ValueError(f"Unknown method: {method_name}")
                     
-            if is_shutdown:
-                break
-            
-            outputs = engine.step()
-            if outputs:
-                self.output_queue.put_nowait(outputs)
+                if self.shutdown_event.is_set():
+                    break
 
-        self.output_queue.put_nowait(None)
-        engine.shutdown()
+                outputs = engine.step()
+                if outputs:
+                    self.output_queue.put_nowait(outputs)
+        finally:
+            engine.shutdown()
     
     def wait_until_ready(self):
         self.ready_event.wait()
 
     def shutdown(self):
-        self.input_queue.put_nowait(("shutdown",))
+        self.shutdown_event.set()
         self.engine_process.join()
         print("Engine has been shut down.")
 
@@ -111,11 +109,13 @@ class EngineClient:
         sampling_params: SamplingParams
     ):
         self.input_queue.put_nowait(
-            ("add", sequence_id, prompt_token_ids, sampling_params)
+            ("add_sequence", (sequence_id, prompt_token_ids, sampling_params), {})
         )
 
-    def get_output(self) -> list[EngineOutput]:
-        return self.output_queue.get()
+    def get_output(self, timeout: float | None) -> list[EngineOutput]:
+        return self.output_queue.get(timeout=timeout)
 
     def abort_sequence(self, sequence_id: str):
-        self.input_queue.put_nowait(("abort", sequence_id))
+        self.input_queue.put_nowait(
+            ("abort_sequence", (sequence_id,), {})
+        )
