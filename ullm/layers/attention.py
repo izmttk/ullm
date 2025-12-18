@@ -326,6 +326,7 @@ class Attention(nn.Module):
     def set_attention_metadata(self, metadata: AttentionMetadata | None):
         self.attention_metadata = metadata
 
+    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,

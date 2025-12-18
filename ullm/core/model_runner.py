@@ -416,10 +416,11 @@ class ModelRunner:
             ) if intermediate_tensors is not None else None
             
             with attention_kv_cache(self.model, attention_metadata):
+                compiled_model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")
                 # Warmup before capture
-                output = self.model(bs_input_ids, bs_positions, bs_intermediate_tensors)
+                output = compiled_model(bs_input_ids, bs_positions, bs_intermediate_tensors)
                 with self.cuda_graph.capture(bs):
-                    output = self.model(bs_input_ids, bs_positions, bs_intermediate_tensors)
+                    output = compiled_model(bs_input_ids, bs_positions, bs_intermediate_tensors)
                     if isinstance(hidden_states, torch.Tensor):
                         hidden_states[:bs] = output
                     else:

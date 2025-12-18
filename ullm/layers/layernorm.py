@@ -13,7 +13,6 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    @torch.compile
     def forward(
         self,
         x: torch.Tensor,

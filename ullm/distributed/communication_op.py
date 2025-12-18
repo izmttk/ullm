@@ -5,7 +5,7 @@ from .parallel_state import Group, get_tp_group, get_pp_group, get_world_group
 
 from typing import Any, Union, Optional
 
-
+@torch.compiler.disable
 def all_gather(
     input: torch.Tensor,
     dim: int = -1,
@@ -38,6 +38,7 @@ def all_gather(
                                             input_size[dim + 1:])
     return output_tensor
 
+@torch.compiler.disable
 def all_reduce(
     input: torch.Tensor,
     op = dist.ReduceOp.SUM,
@@ -51,6 +52,7 @@ def all_reduce(
     dist.all_reduce(input, op, group=group.device_group)
     return input
 
+@torch.compiler.disable
 def reduce_scatter(
     input: torch.Tensor,
     dim: int = -1,
@@ -90,6 +92,7 @@ def reduce_scatter(
     # Reshape before returning
     return output_tensor.movedim(0, dim).contiguous()
 
+@torch.compiler.disable
 def gather(
     input: torch.Tensor,
     dst: int = 0,
@@ -129,6 +132,7 @@ def gather(
         output_tensor = None
     return output_tensor
 
+@torch.compiler.disable
 def broadcast(
     input: torch.Tensor,
     src: int = 0,
@@ -180,6 +184,7 @@ def tensor_model_parallel_gather(input: torch.Tensor,
     tp_group = get_tp_group()
     return gather(input, dst=dst, dim=dim, group=tp_group)
 
+@torch.compiler.disable
 def broadcast_tensor_dict(
     tensor_dict: dict[Any, torch.Tensor] | None = None,
     src: int = 0,
@@ -233,6 +238,7 @@ def broadcast_tensor_dict(
         async_handle.wait()
     return result
 
+@torch.compiler.disable
 def send_tensor_dict(
     tensor_dict: dict[str, Union[torch.Tensor, Any]],
     dst: Optional[int] = None,
@@ -284,6 +290,7 @@ def send_tensor_dict(
         else:
             dist.send(tensor, group_dst=dst, group=group.device_group)
 
+@torch.compiler.disable
 def recv_tensor_dict(
     src: Optional[int] = None,
     group: Optional[Group] = None,

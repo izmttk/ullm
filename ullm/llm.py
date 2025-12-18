@@ -65,7 +65,6 @@ class LLM:
                             num_generated_tokens=output.num_generated_tokens,
                         ))
                         q.put_nowait(None)  # Sentinel for end of generation
-                        del self.request_states[seq_id]
                     else:
                         q.put_nowait(GenerateOutput(
                             token_str=token_str,
@@ -114,7 +113,8 @@ class LLM:
                 if output is None:  # End of generation
                     break
                 yield output
-                
+            
+            del self.request_states[sequence_id]
         # If the request is disconnected by the client, the
         # generate() task will be canceled. So, we abort the
         # request if we end up here.
