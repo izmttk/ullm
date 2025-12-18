@@ -1,7 +1,7 @@
 from .engine import Engine, EngineOutput
 from .common import SamplingParams
 import torch.multiprocessing as mp
-from ..utils import bind_parent_process_lifecycle
+from ..utils import bind_parent_process_lifecycle, kill_process_tree
 import os
 import queue
 
@@ -46,19 +46,19 @@ class EngineClient:
 
     @bind_parent_process_lifecycle
     def engine_main_loop(self):
-        os.setsid()  # 使子进程成为新会话的首进程，防止收到来自终端的信号
-        engine = Engine(
-            model=self.model,
-            gpu_memory_utilization=self.gpu_memory_utilization,
-            max_bs=self.max_bs,
-            tp_size=self.tp_size,
-            pp_size=self.pp_size,
-            nccl_port=self.nccl_port,
-            device_ids=self.device_ids,
-            enforce_eager=self.enforce_eager,
-            context_len=self.context_len,
-        )
+        engine = None
         try:
+            engine = Engine(
+                model=self.model,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                max_bs=self.max_bs,
+                tp_size=self.tp_size,
+                pp_size=self.pp_size,
+                nccl_port=self.nccl_port,
+                device_ids=self.device_ids,
+                enforce_eager=self.enforce_eager,
+                context_len=self.context_len,
+            )
             self.ready_event.set()
             while not self.shutdown_event.is_set():
                 # 如果 engine 中没有未完成的请求了，即 engine 的 waiting 和 running 队列都空了
@@ -92,15 +92,22 @@ class EngineClient:
                 if outputs:
                     self.output_queue.put_nowait(outputs)
         finally:
-            engine.shutdown()
-    
+            self.shutdown_event.set() # 在非正常退出时，无条件设置 shutdown_event
+            self.ready_event.set() # 同上
+            if engine:
+                engine.shutdown()
+            print("Engine has been shut down.")
+
     def wait_until_ready(self):
         self.ready_event.wait()
+        if self.shutdown_event.is_set():
+            raise RuntimeError("Engine initialization failed.")
 
     def shutdown(self):
         self.shutdown_event.set()
-        self.engine_process.join()
-        print("Engine has been shut down.")
+        self.engine_process.join(timeout=5)
+        if self.engine_process.is_alive():
+            kill_process_tree(self.engine_process.pid)
 
     def add_sequence(
         self,

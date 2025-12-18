@@ -127,6 +127,6 @@ class LLM:
             self.engine.abort_sequence(sequence_id)
             del self.request_states[sequence_id]
 
-    def shutdown(self):
+    async def shutdown(self):
         self.output_processor_task.cancel()
-        self.engine.shutdown()
+        await asyncio.to_thread(self.engine.shutdown)

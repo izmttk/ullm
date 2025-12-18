@@ -1,7 +1,7 @@
 from typing import Optional
 from .worker import Worker
 import torch.multiprocessing as mp
-from ..utils import bind_parent_process_lifecycle
+from ..utils import bind_parent_process_lifecycle, kill_process_tree
 import queue
 
 class WorkerClient:
@@ -58,22 +58,25 @@ class WorkerClient:
         self.shutdown_event.set()
     
     def join(self):
-        self.worker_process.join()
+        self.worker_process.join(timeout=5)
+        if self.worker_process.is_alive():
+            kill_process_tree(self.worker_process.pid)
 
     @bind_parent_process_lifecycle
     def worker_main_loop(self):
-        worker = Worker(
-            model=self.model,
-            max_bs=self.max_bs,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            nccl_port=self.nccl_port,
-            enforce_eager=self.enforce_eager,
-            context_len=self.context_len,
-        )
+        worker = None
         try:
+            worker = Worker(
+                model=self.model,
+                max_bs=self.max_bs,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                nccl_port=self.nccl_port,
+                enforce_eager=self.enforce_eager,
+                context_len=self.context_len,
+            )
             worker.init_environment()
             while not self.shutdown_event.is_set():
                 try:
@@ -85,8 +88,9 @@ class WorkerClient:
                 if self.is_driver_worker:
                     self.output_queue.put_nowait((request_id, response))
         finally:
-            worker.destroy_environment()
-            print(f"Worker {self.rank} has shut down.")
+            if worker:
+                worker.destroy_environment()
+            print(f"Worker {self.rank} has been shut down.")
 
     def handle_request(self, worker: Worker, method_name: str, *args, **kwargs):
         # 查找并调用注册的方法
@@ -96,7 +100,7 @@ class WorkerClient:
             # 执行方法
             result = method(*args, **kwargs)
             # 返回成功结果
-            return ('success', result)
+            return result
         else:
             # 方法不存在
-            return ('failed', f"Method '{method_name}' not found")
+            raise ValueError(f"Unknown method: {method_name}")

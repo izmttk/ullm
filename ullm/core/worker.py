@@ -71,7 +71,7 @@ class Worker:
         # See: https://github.com/pytorch/pytorch/issues/115388
         get_world_group().barrier()
         torch.cuda.synchronize()
-        if self.model_runner.cuda_graph is not None:
+        if hasattr(self.model_runner, "cuda_graph") and self.model_runner.cuda_graph is not None:
             self.model_runner.cuda_graph.clear()
 
         destroy_model_parallel()

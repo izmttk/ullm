@@ -28,8 +28,6 @@ class Executor:
         if device_ids is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, device_ids))
 
-        self.shutdown_event = threading.Event()
-
         self.workers: list[WorkerClient] = []
         self.driver_worker: WorkerClient
         for pp_rank in range(pp_size):
@@ -53,29 +51,23 @@ class Executor:
 
         self.pending: dict[str, Future[list[int]]] = {}  # 跟踪进行中的请求 {request_id: future}
         self.collect_thread = threading.Thread(
-            target=self._collect_loop
+            target=self._collect_loop,
+            daemon=True
         )
         self.collect_thread.start()
 
     def _collect_loop(self):
-        while not self.shutdown_event.is_set():
+        while True:
             try:
                 msg = self.driver_worker.recv_response(timeout=0.1)
             except queue.Empty:
                 continue
-            request_id, data = msg
+            request_id, resp = msg
             future = self.pending.pop(request_id, None)
             if future:
-                status, result = data
-                if status == 'success':
-                    future.set_result(result)
-                else:
-                    future.set_exception(Exception(result))
-        print("Executor stopped response collection.")
+                future.set_result(resp)
 
     def shutdown(self):
-        self.shutdown_event.set()
-        self.collect_thread.join()
         for worker in self.workers:
             worker.shutdown()
         for worker in self.workers:

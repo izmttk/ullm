@@ -10,6 +10,7 @@ import fastapi
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import gc
 
 from .protocol import (
     ChatCompletionRequest,
@@ -25,30 +26,40 @@ from ..utils import with_cancellation
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
-
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
-    device_ids = [int(i) for i in args.device_ids.split(",")] if args.device_ids else None
-    engine = LLM(
-        model=args.model,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_bs=args.max_bs,
-        tp_size=args.tp_size,
-        pp_size=args.pp_size,
-        nccl_port=args.nccl_port,
-        device_ids=device_ids,
-        enforce_eager=args.enforce_eager,
-        context_len=args.context_len,
-    )
-    await engine.ready()
+    engine = None
+    try:
+        device_ids = [int(i) for i in args.device_ids.split(",")] if args.device_ids else None
+        engine = LLM(
+            model=args.model,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_bs=args.max_bs,
+            tp_size=args.tp_size,
+            pp_size=args.pp_size,
+            nccl_port=args.nccl_port,
+            device_ids=device_ids,
+            enforce_eager=args.enforce_eager,
+            context_len=args.context_len,
+        )
+        await engine.ready()
 
-    app.state.model_name = args.model
-    app.state.serving_chat = OpenAIServingChat(engine, args.model)
-    app.state.serving_completion = OpenAIServingCompletion(engine, args.model)
-    
-    yield
-    
-    engine.shutdown()
+        app.state.model_name = args.model
+        app.state.serving_chat = OpenAIServingChat(engine, args.model)
+        app.state.serving_completion = OpenAIServingCompletion(engine, args.model)
+        
+        yield
+    finally:
+        if hasattr(app.state, "model_name"):
+            del app.state.model_name
+        if hasattr(app.state, "serving_chat"):
+            del app.state.serving_chat
+        if hasattr(app.state, "serving_completion"):
+            del app.state.serving_completion
+        if engine:
+            await engine.shutdown()
+            del engine
+        gc.collect()
 
 app = fastapi.FastAPI(lifespan=lifespan)
 
@@ -135,4 +146,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     run_server(args)
-

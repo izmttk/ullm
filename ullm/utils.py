@@ -7,12 +7,12 @@ import threading
 import functools
 import traceback
 
-def kill_itself_when_parent_died():
+def kill_itself_when_parent_died(sig = signal.SIGTERM):
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies  
         PR_SET_PDEATHSIG = 1
         libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        libc.prctl(PR_SET_PDEATHSIG, sig)
     else:
         print("kill_itself_when_parent_died is only supported in linux.")
 
@@ -60,16 +60,20 @@ def bind_parent_process_lifecycle(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         # 当父进程死亡时，自动杀死当前进程
-        kill_itself_when_parent_died()
-        
+        kill_itself_when_parent_died(signal.SIGTERM)
         # 获取父进程
         parent_process = psutil.Process().parent()
         assert parent_process is not None, "Parent process not found."
         
+        shutdown_requested = False
         def _handle_exit(signum, frame):
             # 函数执行出错时，通知父进程并杀死自己
-            parent_process.send_signal(signal.SIGTERM)
-            sys.exit(128 + signum)
+            nonlocal shutdown_requested
+            if not shutdown_requested:
+                shutdown_requested = True
+                parent_process.send_signal(signal.SIGTERM)
+                # sys.exit(128 + signum)
+                raise SystemExit()
 
         # 注册信号处理器
         signal.signal(signal.SIGTERM, _handle_exit)
