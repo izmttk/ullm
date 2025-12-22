@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 
+
 class Sampler(nn.Module):
     """Samples the next tokens from the model's outputs.
 
@@ -25,10 +26,10 @@ class Sampler(nn.Module):
         top_ks: torch.Tensor | None = None,
     ):
         is_all_greedy = (
-            temperatures is None and
-            min_ps is None and
-            top_ps is None and
-            top_ks is None
+            temperatures is None
+            and min_ps is None
+            and top_ps is None
+            and top_ks is None
         )
 
         if is_all_greedy:
@@ -55,9 +56,7 @@ class Sampler(nn.Module):
 
 
 def _apply_top_k_top_p(
-    logits: torch.Tensor,
-    p: torch.Tensor | None = None,
-    k: torch.Tensor | None = None
+    logits: torch.Tensor, p: torch.Tensor | None = None, k: torch.Tensor | None = None
 ) -> torch.Tensor:
     if p is None and k is None:
         return logits
@@ -72,7 +71,6 @@ def _apply_top_k_top_p(
         top_k_mask = logits_sort < top_k_mask
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
-
     if p is not None:
         # Apply top-p.
         probs_sort = logits_sort.softmax(dim=-1)
@@ -83,15 +81,14 @@ def _apply_top_k_top_p(
         logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
     # Re-sort the probabilities.
-    logits = torch.empty_like(logits_sort).scatter_(dim=-1,
-                                                    index=logits_idx,
-                                                    src=logits_sort)
+    logits = torch.empty_like(logits_sort).scatter_(
+        dim=-1, index=logits_idx, src=logits_sort
+    )
     return logits
 
 
 def _apply_min_p(
-    logits: torch.Tensor,
-    min_p: torch.Tensor | None = None
+    logits: torch.Tensor, min_p: torch.Tensor | None = None
 ) -> torch.Tensor:
     if min_p is None:
         return logits

@@ -1,12 +1,14 @@
 """
 Pydantic models for OpenAI API protocol.
 """
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/protocol.py
 import time
 from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
+
 
 # Models for error response
 class ErrorResponse(BaseModel):

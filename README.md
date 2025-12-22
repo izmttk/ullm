@@ -36,7 +36,7 @@ NOTE: 我发现当 nccl 版本 < 2.27.3 时，分布式环境的销毁会存在�
 
 ```plaintext
 example:
-python -m ullm.entrypoints.openai.api_server --model Qwen3-0.6B --gpu-memory-utilization 0.9 --tp-size 2 --pp-size 2 --context-len 4096 --host 0.0.0.0 --port 8000
+python -m ullm.entrypoints.api_server --model Qwen3-0.6B --gpu-memory-utilization 0.9 --tp-size 2 --pp-size 2 --context-len 4096 --host 0.0.0.0 --port 8000
 
 usage: api_server.py [-h] [--host HOST] [--port PORT] --model MODEL [--gpu-memory-utilization GPU_MEMORY_UTILIZATION] [--max-bs MAX_BS] [--tp-size TP_SIZE] [--pp-size PP_SIZE]
                      [--nccl-port NCCL_PORT] [--device-ids DEVICE_IDS] [--context-len CONTEXT_LEN] [--enforce-eager]
@@ -101,9 +101,11 @@ Results:
 
 ## TODO
 
-- Graceful Shutdown
-- Better Logging System
-- Benchmark Metrics on API Server
-- More Configurable Options
+- [x] Graceful Shutdown
+- [x] Better Logging System
+- [ ] Multi proc communication optimizations
+- [ ] Overlap Scheduling
+- [ ] Benchmark Metrics on API Server
+- [ ] More Configurable Options
 
 Further development is still ongoing.

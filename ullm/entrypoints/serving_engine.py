@@ -1,25 +1,25 @@
-import asyncio
 from typing import Union
 
 from fastapi.responses import JSONResponse
 
-from ullm.llm import LLM
-from ullm.core.common import SamplingParams
+from ..core.common import SamplingParams
+from ..llm import LLM
 from .protocol import (
-    ErrorResponse,
-    CompletionRequest,
     ChatCompletionRequest,
+    CompletionRequest,
+    ErrorResponse,
 )
 
 
 class OpenAIServing:
-
     def __init__(self, engine: LLM, model_name: str):
         self.engine = engine
         self.model_name = model_name
         self.tokenizer = engine.tokenizer
 
-    async def _generate_full(self, prompt: str, sampling_params: SamplingParams, request_id: str):
+    async def _generate_full(
+        self, prompt: str, sampling_params: SamplingParams, request_id: str
+    ):
         text_outputs = ["" for _ in range(sampling_params.n)]
         finish_reason = None
         num_prompt_tokens = 0
@@ -29,7 +29,9 @@ class OpenAIServing:
                 token_str = res.token_str
                 text_outputs[i] += token_str
             if res.is_finished:
-                finish_reason = res.finish_reason.name.lower() if res.finish_reason else None
+                finish_reason = (
+                    res.finish_reason.name.lower() if res.finish_reason else None
+                )
                 num_prompt_tokens = res.num_prompt_tokens
                 num_generated_tokens = res.num_generated_tokens
         return text_outputs, finish_reason, num_prompt_tokens, num_generated_tokens

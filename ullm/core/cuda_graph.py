@@ -1,6 +1,8 @@
-from contextlib import contextmanager
-import torch
 import bisect
+from contextlib import contextmanager
+
+import torch
+
 
 class CUDAGraph:
     def __init__(self):
@@ -28,10 +30,10 @@ class CUDAGraph:
     def capture(self, bs: int):
         self.max_bs = max(self.max_bs, bs)
         graph = torch.cuda.CUDAGraph()
-        
+
         with torch.cuda.graph(graph, self.graph_pool):
             yield
-        
+
         if self.graph_pool is None:
             self.graph_pool = graph.pool()
         self.graphs[bs] = graph
@@ -45,7 +47,7 @@ class CUDAGraph:
         assert bs <= self.max_bs and self.graphs
         index = bisect.bisect_left(self.captured_bs, bs)
         return self.captured_bs[index]
-    
+
     def clear(self):
         self.graphs.clear()
         self.captured_bs.clear()

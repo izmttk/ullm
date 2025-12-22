@@ -1,22 +1,16 @@
-import sys
 import os
 import signal
+import sys
+import threading
+import time
+from multiprocessing.process import BaseProcess
+
 import psutil
-import ctypes
-import threading  
-import functools
-import traceback
 
-def kill_itself_when_parent_died(sig = signal.SIGTERM):
-    if sys.platform == "linux":
-        # sigkill this process when parent worker manager dies  
-        PR_SET_PDEATHSIG = 1
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, sig)
-    else:
-        print("kill_itself_when_parent_died is only supported in linux.")
 
-def kill_process_tree(parent_pid = None, include_parent: bool = True, skip_pid: int | None = None):
+def kill_process_tree(
+    parent_pid=None, include_parent: bool = True, skip_pid: int | None = None
+):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
     if threading.current_thread() is threading.main_thread():
@@ -55,34 +49,24 @@ def kill_process_tree(parent_pid = None, include_parent: bool = True, skip_pid: 
             pass
 
 
-def bind_parent_process_lifecycle(func):
-    """函数装饰器实现当前进程和父进程生命周期绑定"""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        # 当父进程死亡时，自动杀死当前进程
-        kill_itself_when_parent_died(signal.SIGTERM)
-        # 获取父进程
-        parent_process = psutil.Process().parent()
-        assert parent_process is not None, "Parent process not found."
-        
-        shutdown_requested = False
-        def _handle_exit(signum, frame):
-            # 函数执行出错时，通知父进程并杀死自己
-            nonlocal shutdown_requested
-            if not shutdown_requested:
-                shutdown_requested = True
-                parent_process.send_signal(signal.SIGTERM)
-                # sys.exit(128 + signum)
-                raise SystemExit()
+# shutdown function cannot be a bound method,
+# else the gc cannot collect the object.
+def shutdown(procs: list[BaseProcess] | BaseProcess):
+    proc_list = procs if isinstance(procs, list) else [procs]
+    # Shutdown the process.
+    for proc in proc_list:
+        if proc.is_alive():
+            proc.terminate()
 
-        # 注册信号处理器
-        signal.signal(signal.SIGTERM, _handle_exit)
-        signal.signal(signal.SIGINT,  _handle_exit)
-        
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            traceback.print_exc()
-            _handle_exit(signal.SIGTERM, None)
+    # Allow 5 seconds for remaining procs to terminate.
+    deadline = time.monotonic() + 5
+    for proc in proc_list:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if proc.is_alive():
+            proc.join(remaining)
 
-    return wrapper
+    for proc in proc_list:
+        if proc.is_alive() and (pid := proc.pid) is not None:
+            kill_process_tree(pid)

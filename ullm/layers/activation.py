@@ -1,6 +1,7 @@
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
+
 
 class SiluAndMul(nn.Module):
     """An activation function for SwiGLU.
@@ -15,7 +16,8 @@ class SiluAndMul(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
-    
+
+
 class GeluAndMul(nn.Module):
     """An activation function for GeGLU.
 

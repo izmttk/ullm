@@ -1,8 +1,9 @@
-from typing import Optional
-from collections import abc
-import torch
 import heapq
 import time
+from collections import abc
+from typing import Optional
+
+import torch
 import triton
 import triton.language as tl
 
@@ -33,7 +34,13 @@ def store_kvcache_kernel(
     tl.store(v_cache_ptr + cache_offsets, v)
 
 
-def store_kvcache(k: torch.Tensor, v: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, kv_indices: torch.Tensor):
+def store_kvcache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+):
     num_tokens, num_heads, head_dim = k.shape
     BLOCK_SIZE = num_heads * head_dim
     assert k.stride(-1) == 1 and v.stride(-1) == 1
@@ -41,7 +48,10 @@ def store_kvcache(k: torch.Tensor, v: torch.Tensor, k_cache: torch.Tensor, v_cac
     assert k_cache.stride(-3) == BLOCK_SIZE and v_cache.stride(-3) == BLOCK_SIZE
     assert kv_indices.numel() == num_tokens
     grid = (num_tokens,)
-    store_kvcache_kernel[grid](k, k.stride(0), v, v.stride(0), k_cache, v_cache, kv_indices, BLOCK_SIZE) # type: ignore
+    store_kvcache_kernel[grid](
+        k, k.stride(0), v, v.stride(0), k_cache, v_cache, kv_indices, BLOCK_SIZE
+    )  # type: ignore
+
 
 # KVCachePool should be instantiated in each worker
 class KVCachePool:
@@ -86,8 +96,14 @@ class KVCachePool:
             k_cache = self.k_cache[layer - self.start_layer, index]
             v_cache = self.v_cache[layer - self.start_layer, index]
         return k_cache, v_cache
-    
-    def set_kv_cache(self, layer: int, index: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor):
+
+    def set_kv_cache(
+        self,
+        layer: int,
+        index: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ):
         # self.k_cache[layer - self.start_layer, index] = k_cache
         # self.v_cache[layer - self.start_layer, index] = v_cache
         store_kvcache(
@@ -95,8 +111,9 @@ class KVCachePool:
             v_cache,
             self.k_cache[layer - self.start_layer],
             self.v_cache[layer - self.start_layer],
-            index
+            index,
         )
+
 
 class KVCacheAllocator:
     def __init__(
@@ -116,6 +133,7 @@ class KVCacheAllocator:
     def free(self, free_index: abc.Iterable[int]):
         self.free_slots.extend(free_index)
 
+
 class RadixTreeNode:
     def __init__(
         self,
@@ -124,10 +142,12 @@ class RadixTreeNode:
         parent: Optional["RadixTreeNode"] = None,
         key: tuple[int, ...] = tuple(),
         value: tuple[int, ...] = tuple(),
-        ref_count: int = 0
+        ref_count: int = 0,
     ):
         # 避免可变默认参数导致多个节点共享 children 字典
-        self.children: dict[int, RadixTreeNode] = children if children is not None else {}
+        self.children: dict[int, RadixTreeNode] = (
+            children if children is not None else {}
+        )
         self.parent = parent
         self.key = key
         self.value = value
@@ -149,10 +169,7 @@ def get_prefix_len(key1: abc.Sequence[int], key2: abc.Sequence[int]):
 
 
 class RadixTree:
-    def __init__(
-        self,
-        kv_cache_allocator: KVCacheAllocator
-    ):
+    def __init__(self, kv_cache_allocator: KVCacheAllocator):
         self.root = RadixTreeNode(ref_count=1)
         self.kv_cache_allocator = kv_cache_allocator
 
@@ -167,7 +184,7 @@ class RadixTree:
 
             # get max matched prefix length
             prefix_len = get_prefix_len(child.key, key)
-            
+
             if prefix_len < len(child.key):
                 new_node = self._split_node(child, prefix_len)
                 value.extend(new_node.value)
@@ -182,7 +199,7 @@ class RadixTree:
         cache_indices = value
         last_prefix_node = node
         return cache_indices, last_prefix_node
-    
+
     def insert(self, key: list[int], value: list[int]):
         node = self.root
         child_key = key[0]
@@ -213,12 +230,10 @@ class RadixTree:
         # if we have unmatched keys, create a new node
         if len(key) > 0:
             last_node = self._add_node(
-                parent=last_prefix_node,
-                key=tuple(key),
-                value=tuple(value)
+                parent=last_prefix_node, key=tuple(key), value=tuple(value)
             )
         return total_prefix_len, last_node
-    
+
     def inc_ref(self, node: RadixTreeNode):
         while node != self.root:
             node.ref_count += 1
@@ -257,34 +272,32 @@ class RadixTree:
 
     def _get_leaf_nodes(self):
         leaf_nodes: list[RadixTreeNode] = []
+
         def traverse_tree(node: RadixTreeNode):
             if len(node.children) == 0:
                 leaf_nodes.append(node)
                 return
             for child in node.children.values():
                 traverse_tree(child)
-            
+
         traverse_tree(self.root)
         return leaf_nodes
-    
+
     def _remove_node(self, node: RadixTreeNode):
         parent_node = node.parent
         if parent_node:
             child_key = node.key[0]
             del parent_node.children[child_key]
-    
+
     def _add_node(
         self,
         parent: RadixTreeNode,
         key: tuple[int, ...] = tuple(),
         value: tuple[int, ...] = tuple(),
-        ref_count: int = 0
+        ref_count: int = 0,
     ):
         new_node = RadixTreeNode(
-            parent=parent,
-            key=key,
-            value=value,
-            ref_count=ref_count
+            parent=parent, key=key, value=value, ref_count=ref_count
         )
         new_node.parent = parent
         parent.children[new_node.key[0]] = new_node
@@ -297,7 +310,7 @@ class RadixTree:
             children={node.key[split_len]: node},
             key=node.key[:split_len],
             value=node.value[:split_len],
-            ref_count=node.ref_count
+            ref_count=node.ref_count,
         )
         node.parent = new_node
         node.key = node.key[split_len:]
@@ -308,6 +321,7 @@ class RadixTree:
             new_node.parent.children[new_child_key] = new_node
 
         return new_node
+
 
 class KVCacheManager:
     def __init__(self, size: int):
@@ -324,7 +338,9 @@ class KVCacheManager:
             indices = self.kv_cache_allocator.alloc(num_slots)
         # if still no space, raise error
         if indices is None:
-            raise RuntimeError(f"Failed to allocate {num_slots} slots, KV cache is full!")
+            raise RuntimeError(
+                f"Failed to allocate {num_slots} slots, KV cache is full!"
+            )
         return indices
 
     def free_slots(self, indices: abc.Iterable[int]):
@@ -354,7 +370,9 @@ class KVCacheManager:
             # 释放重复的kv cache slots
             self.kv_cache_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
             # 更新sequence的kv_indices的重复部分
-            seq.kv_indices[old_prefix_len:new_prefix_len] = new_indices[old_prefix_len:new_prefix_len]
+            seq.kv_indices[old_prefix_len:new_prefix_len] = new_indices[
+                old_prefix_len:new_prefix_len
+            ]
 
         self.unfinished_sequences[seq.seq_id] = (len(new_indices), new_last_node)
         self.radix_tree.dec_ref(old_last_node)

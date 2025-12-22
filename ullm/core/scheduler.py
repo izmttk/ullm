@@ -1,14 +1,15 @@
 from collections import deque
 from typing import Deque
 
+from ..config import EngineConfig
 from .common import (
+    ForwardBatch,
+    ForwardMode,
     Sequence,
     SequenceStatus,
-    ForwardMode,
-    ForwardBatch,
 )
-
 from .kv_cache import KVCacheManager
+
 
 class Scheduler:
     """
@@ -31,18 +32,18 @@ class Scheduler:
 
     def __init__(
         self,
+        config: EngineConfig,
         kv_cache_size: int,
-        max_bs: int = 32,
     ):
         self.kv_cache_size = kv_cache_size
-        self.max_bs = max_bs
-        
+        self.max_bs = config.max_bs
+
         self.sequences: dict[str, Sequence] = {}  # All sequences by seq_id
 
         # Queues and registries
         self.waiting: Deque[Sequence] = deque()
         self.running: Deque[Sequence] = deque()
-        
+
         # To avoid scheduling the same sequence multiple times in one step
         # it's a subset of running queue
         self.scheduled: set[str] = set()
@@ -113,7 +114,7 @@ class Scheduler:
                 num_seqs=len(batch),
                 seqs=batch,
             )
-        
+
         return None
 
     def alloc_kv_slots(self, seq: Sequence):
@@ -143,7 +144,7 @@ class Scheduler:
         """
         if seq.status == SequenceStatus.FINISHED:
             return
-        if not seq in self.running:
+        if seq not in self.running:
             return
         self.running.remove(seq)
         if seq.seq_id in self.scheduled:
@@ -164,7 +165,7 @@ class Scheduler:
         """
         if seq.status != SequenceStatus.RUNNING:
             return
-        
+
         self.scheduled.remove(seq.seq_id)
         seq.cached_kv_len = len(seq.kv_indices)
         seq.token_ids.append(new_token_id)
@@ -179,12 +180,12 @@ class Scheduler:
 
         if seq.status == SequenceStatus.WAITING:
             self.waiting.remove(seq)
-        
+
         if seq.status == SequenceStatus.RUNNING:
             self.running.remove(seq)
             if seq.seq_id in self.scheduled:
                 self.scheduled.remove(seq.seq_id)
-        
+
         seq.status = SequenceStatus.FINISHED
         self.kv_manager.cache_sequence(seq)
         self.sequences.pop(seq.seq_id, None)

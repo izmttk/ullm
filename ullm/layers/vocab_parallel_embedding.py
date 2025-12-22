@@ -1,18 +1,21 @@
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
-from ..distributed.parallel_state import get_tp_group, get_pp_group
-from ..distributed.communication_op import tensor_model_parallel_all_reduce, tensor_model_parallel_all_gather
-
+from ..distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
+from ..distributed.parallel_state import get_tp_group
 from .utils import divide
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
-def pad_vocab_size(vocab_size: int,
-                   pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
+
+def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
     """Pad the vocab size to the given value."""
     return ((vocab_size + pad_to - 1) // pad_to) * pad_to
+
 
 class VocabParallelEmbedding(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
@@ -20,7 +23,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     Adapted from torch.nn.Embedding, note that we pad the vocabulary size to
     make sure it is divisible by the number of model parallel GPUs.
 
-    In this example, we will have the vocab size = 1010, and padding to 64. 
+    In this example, we will have the vocab size = 1010, and padding to 64.
     Therefore, the total vocab size with padding will be 1024.
     Therefore, the tensor format looks like the following:
     TP1, rank 0 (no sharding):
@@ -65,25 +68,32 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.embedding_dim = embedding_dim
 
         # Divide the weight matrix along the vocaburaly dimension.
-        self.num_embeddings_per_partition = divide(self.num_embeddings_padded, self.tp_size)
+        self.num_embeddings_per_partition = divide(
+            self.num_embeddings_padded, self.tp_size
+        )
 
         self.vocab_start_index = self.num_embeddings_per_partition * self.tp_rank
-        self.vocab_end_index = self.vocab_start_index + self.num_embeddings_per_partition
-        
+        self.vocab_end_index = (
+            self.vocab_start_index + self.num_embeddings_per_partition
+        )
+
         self.weight = nn.Parameter(
             torch.empty(
-                self.num_embeddings_per_partition, self.embedding_dim, dtype=params_dtype
+                self.num_embeddings_per_partition,
+                self.embedding_dim,
+                dtype=params_dtype,
             )
         )
         setattr(self.weight, "weight_loader", self.weight_loader)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-
         # Shard indexes for loading the weight
         start_idx = self.vocab_start_index
         shard_size = self.vocab_end_index - start_idx
 
-        assert loaded_weight.shape[0] == self.num_embeddings, f"{self.num_embeddings=} {loaded_weight.shape[0]=}"
+        assert loaded_weight.shape[0] == self.num_embeddings, (
+            f"{self.num_embeddings=} {loaded_weight.shape[0]=}"
+        )
 
         # Copy the data.
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
@@ -106,6 +116,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             output = F.embedding(x, self.weight)
         return output
+
 
 class ParallelLMHead(VocabParallelEmbedding):
     """Parallelized LM head.

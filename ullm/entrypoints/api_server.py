@@ -2,16 +2,19 @@
 This file is adapted from
 https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/api_server.py
 """
+
 import argparse
-import asyncio
+import gc
 from contextlib import asynccontextmanager
-import uvicorn
+
 import fastapi
+import uvicorn
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import gc
 
+from ..config import EngineConfig, ServerConfig
+from ..llm import LLM
 from .protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -19,35 +22,22 @@ from .protocol import (
     ModelCard,
     ModelList,
 )
-from ullm.llm import LLM
 from .serving_chat import OpenAIServingChat
 from .serving_completion import OpenAIServingCompletion
-from ..utils import with_cancellation
+from .utils import with_cancellation
 
-TIMEOUT_KEEP_ALIVE = 5  # seconds
 
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
     engine = None
     try:
-        device_ids = [int(i) for i in args.device_ids.split(",")] if args.device_ids else None
-        engine = LLM(
-            model=args.model,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            max_bs=args.max_bs,
-            tp_size=args.tp_size,
-            pp_size=args.pp_size,
-            nccl_port=args.nccl_port,
-            device_ids=device_ids,
-            enforce_eager=args.enforce_eager,
-            context_len=args.context_len,
-        )
-        await engine.ready()
+        config = EngineConfig.from_args(args)
+        engine = LLM(config)
 
         app.state.model_name = args.model
         app.state.serving_chat = OpenAIServingChat(engine, args.model)
         app.state.serving_completion = OpenAIServingCompletion(engine, args.model)
-        
+
         yield
     finally:
         if hasattr(app.state, "model_name"):
@@ -61,7 +51,9 @@ async def lifespan(app: fastapi.FastAPI):
             del engine
         gc.collect()
 
+
 app = fastapi.FastAPI(lifespan=lifespan)
+
 
 def create_error_response(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(
@@ -69,14 +61,17 @@ def create_error_response(status_code: int, message: str) -> JSONResponse:
         status_code=status_code,
     )
 
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: fastapi.Request, exc):  # pylint: disable=unused-argument
     return create_error_response(400, str(exc))
+
 
 @app.get("/v1/models")
 async def show_models(request: fastapi.Request):
     model_card = ModelCard(id=request.app.state.model_name)
     return ModelList(data=[model_card])
+
 
 @app.post("/v1/completions")
 @with_cancellation
@@ -84,11 +79,15 @@ async def create_completion(request: CompletionRequest, raw_request: fastapi.Req
     serving_completion = raw_request.app.state.serving_completion
     return await serving_completion.create_completion(request)
 
+
 @app.post("/v1/chat/completions")
 @with_cancellation
-async def create_chat_completion(request: ChatCompletionRequest, raw_request: fastapi.Request):
+async def create_chat_completion(
+    request: ChatCompletionRequest, raw_request: fastapi.Request
+):
     serving_chat = raw_request.app.state.serving_chat
     return await serving_chat.create_chat_completion(request)
+
 
 def run_server(args: argparse.Namespace):
     app.add_middleware(
@@ -99,13 +98,16 @@ def run_server(args: argparse.Namespace):
         allow_headers=["*"],
     )
 
+    server_config = ServerConfig.from_args(args)
+
     uvicorn.run(
         app,
-        host=args.host,
-        port=args.port,
+        host=server_config.host,
+        port=server_config.port,
         log_level="debug",
-        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+        timeout_keep_alive=server_config.timeout_keep_alive,
     )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -144,5 +146,5 @@ if __name__ == "__main__":
         help="Enforce eager execution, disable CUDA graph",
     )
     args = parser.parse_args()
-    
+
     run_server(args)

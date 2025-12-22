@@ -1,18 +1,23 @@
+import gc
+import os
+
 import torch
+from transformers import AutoConfig, PretrainedConfig
+
+from ..distributed.communication_op import all_gather
+from ..distributed.parallel_state import get_pp_group, get_tp_group
+from ..distributed.utils import get_pp_indices
+from ..layers.attention import AttentionBackend, attention_kv_cache
+from ..layers.sampler import Sampler
+from ..layers.utils import IntermediateTensors
+from ..logger import init_logger
 from ..model_loader import load_model
 from ..models.registry import MODEL_REGISTRY
-from transformers import AutoConfig, PretrainedConfig
-from ..layers.sampler import Sampler
-from .kv_cache import KVCachePool
 from .common import ForwardBatch, ForwardMode
 from .cuda_graph import CUDAGraph
-from ..distributed.communication_op import all_gather
-from ..distributed.parallel_state import get_tp_group, get_pp_group
-from ..distributed.utils import get_pp_indices
-from ..layers.utils import IntermediateTensors
-from ..layers.attention import attention_kv_cache, AttentionBackend
-import os
-import gc
+from .kv_cache import KVCachePool
+
+logger = init_logger(__name__)
 
 _STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.float16,
@@ -22,12 +27,13 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
     "bfloat16": torch.bfloat16,
 }
 
+
 def set_cuda_arch():
     capability = torch.cuda.get_device_capability()
     arch = f"{capability[0]}.{capability[1]}"
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
-    
-    
+
+
 def get_model_config_per_gpu(
     hf_config: PretrainedConfig,
     tp_size: int,
@@ -35,19 +41,23 @@ def get_model_config_per_gpu(
     pp_size: int,
     pp_rank: int,
 ):
-    hf_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", "float16")
+    hf_dtype = getattr(hf_config, "dtype", None) or getattr(
+        hf_config, "torch_dtype", "float16"
+    )
     dtype: torch.dtype = _STR_DTYPE_TO_TORCH_DTYPE[hf_dtype]
-    
-    start_layer, end_layer = get_pp_indices(hf_config.num_hidden_layers, pp_rank, pp_size)
+
+    start_layer, end_layer = get_pp_indices(
+        hf_config.num_hidden_layers, pp_rank, pp_size
+    )
     num_layers = end_layer - start_layer
     num_heads = int(hf_config.num_attention_heads) // tp_size
     num_kv_heads = max(1, hf_config.num_key_value_heads // tp_size)
-    
+
     if hasattr(hf_config, "head_dim"):
         head_dim = int(hf_config.head_dim)
     else:
         head_dim = int(hf_config.hidden_size // hf_config.num_attention_heads)
-    
+
     return (
         dtype,
         start_layer,
@@ -55,8 +65,9 @@ def get_model_config_per_gpu(
         num_layers,
         num_heads,
         num_kv_heads,
-        head_dim
+        head_dim,
     )
+
 
 class ModelRunner:
     def __init__(
@@ -75,7 +86,7 @@ class ModelRunner:
         self.enforce_eager = enforce_eager
         self.context_len = context_len
         set_cuda_arch()
-    
+
     def initialize(self, gpu_memory_utilization: float = 0.9):
         # Initialize Model
         self.load_model()
@@ -83,7 +94,7 @@ class ModelRunner:
         # Initialize KV Cache
         kv_cache_size = self.profile_kv_cache_size(gpu_memory_utilization)
         if self.rank == 0:
-            print(f"Max num tokens in kv cache: {kv_cache_size}")
+            logger.info(f"Max num tokens in kv cache: {kv_cache_size}")
         self.kv_cache_size = kv_cache_size
         self.kv_cache = KVCachePool(
             dtype=self.dtype,
@@ -111,13 +122,10 @@ class ModelRunner:
             self.cuda_graph = CUDAGraph()
             self.capture_graph()
         else:
-            self.cuda_graph = None  
-      
+            self.cuda_graph = None
+
     def load_model(self):
-        
-        hf_config = AutoConfig.from_pretrained(
-            self.model_path, trust_remote_code=True
-        )
+        hf_config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
 
         architectures = getattr(hf_config, "architectures", [])
         ModelClass = None
@@ -126,17 +134,19 @@ class ModelRunner:
             if arch in MODEL_REGISTRY:
                 ModelClass, ConfigClass = MODEL_REGISTRY[arch]
                 break
-        assert ModelClass is not None and ConfigClass is not None, \
+        assert ModelClass is not None and ConfigClass is not None, (
             f"Model arch {hf_config.architectures} not supported."
-            
+        )
+
         self.hf_config = ConfigClass()
         self.hf_config.update(hf_config.to_dict())
-        
-        print(f"Rank {self.rank} loading model {self.model_path} with type {ModelClass.__name__}.")
-        
+
+        logger.debug(
+            f"Rank {self.rank} loading model {self.model_path} with type {ModelClass.__name__}."
+        )
+
         torch_default_dtype = torch.get_default_dtype()
-        
-        
+
         (
             self.dtype,
             self.start_layer,
@@ -144,7 +154,7 @@ class ModelRunner:
             self.num_layers,
             self.num_heads,
             self.num_kv_heads,
-            self.head_dim
+            self.head_dim,
         ) = get_model_config_per_gpu(
             self.hf_config,
             get_tp_group().size,
@@ -152,29 +162,39 @@ class ModelRunner:
             get_pp_group().size,
             get_pp_group().group_rank,
         )
-        print(f"Rank {self.rank} model config: {self.num_layers} layers, "
-              f"{self.num_heads} heads, {self.num_kv_heads} kv heads, head dim {self.head_dim}, "
-              f"dtype {self.dtype}, layers {self.start_layer}-{self.end_layer}.")
-        
+        logger.debug(
+            f"Rank {self.rank} model config: {self.num_layers} layers, "
+            f"{self.num_heads} heads, {self.num_kv_heads} kv heads, head dim {self.head_dim}, "
+            f"dtype {self.dtype}, layers {self.start_layer}-{self.end_layer}."
+        )
+
         torch.set_default_dtype(self.dtype)
 
         self.model = ModelClass(self.hf_config)
         self.model.to(self.device)
 
         self.sampler = Sampler()
-        
+
         load_model(self.model, self.model_path)
-        
+
         torch.set_default_dtype(torch_default_dtype)
 
     def profile_kv_cache_size(self, gpu_memory_utilization: float = 0.9):
-        cache_memsize_per_token = self.num_layers * self.num_kv_heads * self.head_dim * 2 * self.dtype.itemsize
-        
+        cache_memsize_per_token = (
+            self.num_layers
+            * self.num_kv_heads
+            * self.head_dim
+            * 2
+            * self.dtype.itemsize
+        )
+
         gc.collect()
         torch.cuda.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info(self.device)
-        
-        max_num_tokens = int(free_gpu_memory * gpu_memory_utilization) // cache_memsize_per_token
+
+        max_num_tokens = (
+            int(free_gpu_memory * gpu_memory_utilization) // cache_memsize_per_token
+        )
         max_num_tokens = torch.tensor([max_num_tokens], device=self.device)
         max_num_tokens = all_gather(max_num_tokens)
         max_num_tokens = int(max_num_tokens.min().item())
@@ -188,7 +208,7 @@ class ModelRunner:
         positions: list[int] = []
 
         for seq in batch.seqs:
-            input_ids.extend(seq.token_ids[seq.cached_kv_len:])
+            input_ids.extend(seq.token_ids[seq.cached_kv_len :])
             positions.extend(range(seq.cached_kv_len, len(seq.token_ids)))
 
         tensor_input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
@@ -198,10 +218,10 @@ class ModelRunner:
             tensor_input_ids,
             tensor_positions,
         )
-    
+
     def prepare_sampling_params(self, batch: ForwardBatch):
         vocab_size = self.hf_config.vocab_size
-        
+
         temperatures = []
         min_ps = []
         top_ps = []
@@ -216,20 +236,19 @@ class ModelRunner:
             else:
                 top_k = min(top_k, vocab_size)
             top_ks.append(top_k)
-        
-        tensor_temperatures = torch.tensor(temperatures, dtype=torch.float, device=self.device)
+
+        tensor_temperatures = torch.tensor(
+            temperatures, dtype=torch.float, device=self.device
+        )
         tensor_min_ps = torch.tensor(min_ps, dtype=torch.float, device=self.device)
         tensor_top_ps = torch.tensor(top_ps, dtype=torch.float, device=self.device)
         tensor_top_ks = torch.tensor(top_ks, dtype=torch.long, device=self.device)
 
-        return (
-            tensor_temperatures,
-            tensor_min_ps,
-            tensor_top_ps,
-            tensor_top_ks
-        )
-    
-    def prepare_last_hidden_states(self, batch: ForwardBatch, hidden_states: torch.Tensor):
+        return (tensor_temperatures, tensor_min_ps, tensor_top_ps, tensor_top_ks)
+
+    def prepare_last_hidden_states(
+        self, batch: ForwardBatch, hidden_states: torch.Tensor
+    ):
         last_indices = []
         cu_seq_len = 0
         for seq in batch.seqs:
@@ -239,18 +258,17 @@ class ModelRunner:
 
     @torch.inference_mode()
     def execute_model(
-        self,
-        batch: ForwardBatch,
-        intermediate_tensors: IntermediateTensors | None
+        self, batch: ForwardBatch, intermediate_tensors: IntermediateTensors | None
     ) -> torch.Tensor | IntermediateTensors:
-        assert hasattr(self, 'model') and hasattr(self, 'sampler'), \
+        assert hasattr(self, "model") and hasattr(self, "sampler"), (
             "Model and sampler must be loaded before execution."
+        )
         assert hasattr(self, "kv_cache"), "KV Cache not initialized yet."
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
-            
+
         if batch.num_seqs == 0:
             if get_pp_group().is_last_rank:
                 return torch.empty((0,), device=self.device)
@@ -258,11 +276,15 @@ class ModelRunner:
                 return IntermediateTensors()
 
         # Forward pass
-        if self.cuda_graph is not None and self.cuda_graph.is_captured and batch.forward_mode == ForwardMode.DECODE:
+        if (
+            self.cuda_graph is not None
+            and self.cuda_graph.is_captured
+            and batch.forward_mode == ForwardMode.DECODE
+        ):
             hidden_states = self._execute_model_cuda_graph(batch, intermediate_tensors)
         else:
             hidden_states = self._execute_model_eager(batch, intermediate_tensors)
-            
+
         if not get_pp_group().is_last_rank:
             assert isinstance(hidden_states, IntermediateTensors)
             # For mid-pipeline stages, return the hidden states.
@@ -274,48 +296,41 @@ class ModelRunner:
         logits = self.model.compute_logits(hidden_states)
 
         # Sampling
-        (
-            temperatures,
-            min_ps,
-            top_ps,
-            top_ks
-        ) = self.prepare_sampling_params(batch)
+        (temperatures, min_ps, top_ps, top_ks) = self.prepare_sampling_params(batch)
         output_ids = self.sampler(logits, temperatures, min_ps, top_ps, top_ks)
 
         return output_ids
-    
+
     def _execute_model_cuda_graph(
-        self,
-        batch: ForwardBatch,
-        intermediate_tensors: IntermediateTensors | None
+        self, batch: ForwardBatch, intermediate_tensors: IntermediateTensors | None
     ) -> torch.Tensor | IntermediateTensors:
         assert self.cuda_graph is not None
-        
-        bs = batch.num_seqs # Only for decoding now
+
+        bs = batch.num_seqs  # Only for decoding now
         padded_bs = self.cuda_graph.match_bs(bs)
-        
+
         input_ids, positions = self.prepare_input(batch)
-        
+
         input_idx_buffer = self.cuda_graph.get_input_buffer("input_ids")
         positions_buffer = self.cuda_graph.get_input_buffer("positions")
-        
+
         input_idx_buffer[:bs] = input_ids
         positions_buffer[:bs] = positions
-        
+
         if intermediate_tensors is not None:
             for name, tensor in intermediate_tensors.items():
                 buffer = self.cuda_graph.get_input_buffer(name)
                 buffer[:bs] = tensor
-        
+
         attention_metadata = self.attn_backend.build_metadata_for_cuda_graph_replay(
             graph=self.cuda_graph,
             batch=batch,
             padded_bs=padded_bs,
         )
-        
+
         with attention_kv_cache(self.model, attention_metadata):
             self.cuda_graph.replay(bs=padded_bs)
-        
+
         if get_pp_group().is_last_rank:
             hidden_states_buffer = self.cuda_graph.get_output_buffer("hidden_states")
             hidden_states = hidden_states_buffer[:bs]
@@ -327,12 +342,10 @@ class ModelRunner:
             return intermediate_tensors
 
     def _execute_model_eager(
-        self,
-        batch: ForwardBatch,
-        intermediate_tensors: IntermediateTensors | None
+        self, batch: ForwardBatch, intermediate_tensors: IntermediateTensors | None
     ) -> torch.Tensor | IntermediateTensors:
         input_ids, positions = self.prepare_input(batch)
-        
+
         attention_metadata = self.attn_backend.build_metadata(batch=batch)
 
         with attention_kv_cache(self.model, attention_metadata):
@@ -346,24 +359,16 @@ class ModelRunner:
         graph_bs = [1, 2, 4, 8] + list(range(16, self.max_bs, 16))
         if self.max_bs not in graph_bs:
             graph_bs.append(self.max_bs)
-        print("Capturing CUDA graphs for batch sizes:", graph_bs)
-        
+        logger.info("Capturing CUDA graphs for batch sizes:", graph_bs)
+
         self.attn_backend.prepare_for_cuda_graph_capture(
             graph=self.cuda_graph,
             max_bs=self.max_bs,
             context_len=self.context_len,
         )
-        
-        input_ids = torch.zeros(
-            (self.max_bs,),
-            dtype=torch.long,
-            device=self.device
-        )
-        positions = torch.zeros(
-            (self.max_bs,),
-            dtype=torch.long,
-            device=self.device
-        )
+
+        input_ids = torch.zeros((self.max_bs,), dtype=torch.long, device=self.device)
+        positions = torch.zeros((self.max_bs,), dtype=torch.long, device=self.device)
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
@@ -376,7 +381,7 @@ class ModelRunner:
             hidden_states = torch.zeros(
                 (self.max_bs, self.hf_config.hidden_size),
                 dtype=self.dtype,
-                device=self.device
+                device=self.device,
             )
         else:
             hidden_states = self.model.make_empty_intermediate_tensors(
@@ -384,43 +389,55 @@ class ModelRunner:
                 dtype=self.dtype,
                 device=self.device,
             )
-        
+
         # Set input buffers
         self.cuda_graph.set_input_buffer("input_ids", input_ids)
         self.cuda_graph.set_input_buffer("positions", positions)
-        
+
         if intermediate_tensors is not None:
             for name, tesor in intermediate_tensors.items():
                 self.cuda_graph.set_input_buffer(name, tesor)
-        
+
         # Set output buffers
         if isinstance(hidden_states, torch.Tensor):
             self.cuda_graph.set_output_buffer("hidden_states", hidden_states)
         else:
             for name, tesor in hidden_states.items():
                 self.cuda_graph.set_output_buffer(name, tesor)
-        
+
         # Capture graphs for different batch sizes
         for bs in reversed(graph_bs):
-            attention_metadata = self.attn_backend.build_metadata_for_cuda_graph_capture(
-                graph=self.cuda_graph,
-                bs=bs,
-                context_len=self.context_len,
+            attention_metadata = (
+                self.attn_backend.build_metadata_for_cuda_graph_capture(
+                    graph=self.cuda_graph,
+                    bs=bs,
+                    context_len=self.context_len,
+                )
             )
-            
+
             # prepare sliced inputs
             bs_input_ids = input_ids[:bs]
             bs_positions = positions[:bs]
-            bs_intermediate_tensors = IntermediateTensors(
-                {name: tensor[:bs] for name, tensor in intermediate_tensors.items()}
-            ) if intermediate_tensors is not None else None
-            
+            bs_intermediate_tensors = (
+                IntermediateTensors(
+                    {name: tensor[:bs] for name, tensor in intermediate_tensors.items()}
+                )
+                if intermediate_tensors is not None
+                else None
+            )
+
             with attention_kv_cache(self.model, attention_metadata):
-                compiled_model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")
+                compiled_model = torch.compile(
+                    self.model, mode="max-autotune-no-cudagraphs"
+                )
                 # Warmup before capture
-                output = compiled_model(bs_input_ids, bs_positions, bs_intermediate_tensors)
+                output = compiled_model(
+                    bs_input_ids, bs_positions, bs_intermediate_tensors
+                )
                 with self.cuda_graph.capture(bs):
-                    output = compiled_model(bs_input_ids, bs_positions, bs_intermediate_tensors)
+                    output = compiled_model(
+                        bs_input_ids, bs_positions, bs_intermediate_tensors
+                    )
                     if isinstance(hidden_states, torch.Tensor):
                         hidden_states[:bs] = output
                     else:

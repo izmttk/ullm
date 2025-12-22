@@ -1,5 +1,6 @@
-from dataclasses import dataclass, field
 import enum
+from dataclasses import dataclass, field
+
 
 @dataclass
 class SamplingParams:
@@ -15,9 +16,11 @@ class SamplingParams:
     ignore_eos: bool = False
     eos_token_id: int = -1
 
+
 class FinishReason(enum.Enum):
     STOP = enum.auto()
     LENGTH = enum.auto()
+
 
 @dataclass
 class GenerateOutput:
@@ -26,6 +29,7 @@ class GenerateOutput:
     finish_reason: FinishReason | None
     num_prompt_tokens: int
     num_generated_tokens: int
+
 
 @dataclass
 class EngineOutput:
@@ -36,10 +40,12 @@ class EngineOutput:
     num_prompt_tokens: int
     num_generated_tokens: int
 
+
 class SequenceStatus(enum.Enum):
     WAITING = enum.auto()
     RUNNING = enum.auto()
     FINISHED = enum.auto()
+
 
 @dataclass
 class Sequence:
@@ -54,9 +60,11 @@ class Sequence:
     cached_kv_len: int = 0
     # stream:  bool = False
 
+
 class ForwardMode(enum.Enum):
     PREFILL = enum.auto()
     DECODE = enum.auto()
+
 
 @dataclass
 class ForwardBatch:
