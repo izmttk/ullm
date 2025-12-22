@@ -89,6 +89,37 @@ async def create_chat_completion(
     return await serving_chat.create_chat_completion(request)
 
 
+def patch_uvicorn_server():
+    import asyncio
+
+    from uvicorn.server import logger
+
+    async def _wait_tasks_to_complete(self) -> None:
+        # Wait for existing connections to finish sending responses.
+        if self.server_state.connections and not self.force_exit:
+            msg = "Waiting for connections to close. (CTRL+C to force quit)"
+            logger.info(msg)
+            while self.server_state.connections and not self.force_exit:
+                await asyncio.sleep(0.1)
+
+        # Wait for existing tasks to complete.
+        if self.server_state.tasks and not self.force_exit:
+            msg = "Waiting for background tasks to complete. (CTRL+C to force quit)"
+            logger.info(msg)
+            while self.server_state.tasks and not self.force_exit:
+                await asyncio.sleep(0.1)
+
+        # HACK: Cancel all tasks if force_exit is set
+        # This prevents uvicorn from hanging when there are still incomplete requests
+        if self.force_exit:
+            for t in self.server_state.tasks:
+                t.cancel()
+        for server in self.servers:
+            await server.wait_closed()
+
+    uvicorn.server.Server._wait_tasks_to_complete = _wait_tasks_to_complete
+
+
 def run_server(args: argparse.Namespace):
     app.add_middleware(
         CORSMiddleware,
@@ -100,6 +131,8 @@ def run_server(args: argparse.Namespace):
 
     server_config = ServerConfig.from_args(args)
 
+    # HACK: Patch uvicorn server to handle force exit properly
+    patch_uvicorn_server()
     uvicorn.run(
         app,
         host=server_config.host,

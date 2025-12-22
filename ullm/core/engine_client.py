@@ -1,3 +1,4 @@
+import os
 import queue
 import signal
 import threading
@@ -21,6 +22,10 @@ def run_engine_loop(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
 ):
+    # Prevent SIGINT from propagating to the engine process
+    # This allows the main process to handle shutdown manually
+    os.setsid()
+
     report_pipe.send(b"HELLO")
     logger.setLevel(config.log_level)
 

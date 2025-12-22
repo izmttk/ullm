@@ -1,6 +1,7 @@
 import time
 from typing import AsyncGenerator
 
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from .protocol import (
@@ -18,64 +19,84 @@ from .serving_engine import OpenAIServing
 
 class OpenAIServingChat(OpenAIServing):
     async def create_chat_completion(self, request: ChatCompletionRequest):
-        if request.logit_bias:
-            return self.create_error_response(400, "logit_bias is not supported")
-        if isinstance(request.messages, str):
-            return self.create_error_response(400, "string messages are not supported")
-        if request.presence_penalty is not None and request.presence_penalty != 0.0:
-            return self.create_error_response(400, "presence_penalty is not supported")
-        if request.frequency_penalty is not None and request.frequency_penalty != 0.0:
-            return self.create_error_response(400, "frequency_penalty is not supported")
+        try:
+            if request.logit_bias:
+                raise ValueError("logit_bias is not supported")
+            if isinstance(request.messages, str):
+                raise ValueError("string messages are not supported")
+            if request.presence_penalty is not None and request.presence_penalty != 0.0:
+                raise ValueError("presence_penalty is not supported")
+            if (
+                request.frequency_penalty is not None
+                and request.frequency_penalty != 0.0
+            ):
+                raise ValueError("frequency_penalty is not supported")
 
-        create_time_ns = time.time_ns()
-        create_time_sec = create_time_ns // 1_000_000_000
+            create_time_ns = time.time_ns()
+            create_time_sec = create_time_ns // 1_000_000_000
 
-        conversation = [message.model_dump() for message in request.messages]
-        prompt_or_tokens = self.tokenizer.apply_chat_template(
-            conversation=conversation, tokenize=False, add_generation_prompt=True
-        )
-        prompt = str(prompt_or_tokens)
-
-        request_id = f"chatcmpl-{create_time_ns}"
-
-        sampling_params = self._extract_sampling_params(request)
-
-        if request.stream:
-            return StreamingResponse(
-                self.chat_completion_stream_generator(
-                    request, prompt, request_id, create_time_sec
-                ),
-                media_type="text/event-stream",
+            conversation = [message.model_dump() for message in request.messages]
+            prompt_or_tokens = self.tokenizer.apply_chat_template(
+                conversation=conversation, tokenize=False, add_generation_prompt=True
             )
+            prompt = str(prompt_or_tokens)
 
-        (
-            text_outputs,
-            finish_reason,
-            num_prompt_tokens,
-            num_generated_tokens,
-        ) = await self._generate_full(prompt, sampling_params, request_id)
-        assert finish_reason == "stop" or finish_reason == "length"
-        choices = [
-            ChatCompletionResponseChoice(
-                index=i,
-                message=ChatMessage(role="assistant", content=text_outputs[i]),
-                finish_reason=finish_reason,
+            request_id = f"chatcmpl-{create_time_ns}"
+
+            sampling_params = self._extract_sampling_params(request)
+
+            if request.stream:
+                return StreamingResponse(
+                    self.chat_completion_stream_generator(
+                        request, prompt, request_id, create_time_sec
+                    ),
+                    media_type="text/event-stream",
+                )
+
+            (
+                text_outputs,
+                finish_reason,
+                num_prompt_tokens,
+                num_generated_tokens,
+            ) = await self._generate_full(prompt, sampling_params, request_id)
+            assert finish_reason == "stop" or finish_reason == "length"
+            choices = [
+                ChatCompletionResponseChoice(
+                    index=i,
+                    message=ChatMessage(role="assistant", content=text_outputs[i]),
+                    finish_reason=finish_reason,
+                )
+                for i in range(sampling_params.n)
+            ]
+            usage = UsageInfo(
+                prompt_tokens=num_prompt_tokens,
+                completion_tokens=num_generated_tokens,
+                total_tokens=num_prompt_tokens + num_generated_tokens,
             )
-            for i in range(sampling_params.n)
-        ]
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
-            total_tokens=num_prompt_tokens + num_generated_tokens,
-        )
-        return ChatCompletionResponse(
-            id=request_id,
-            object="chat.completion",
-            created=create_time_sec,
-            model=self.model_name,
-            choices=choices,
-            usage=usage,
-        )
+            return ChatCompletionResponse(
+                id=request_id,
+                object="chat.completion",
+                created=create_time_sec,
+                model=self.model_name,
+                choices=choices,
+                usage=usage,
+            )
+        except HTTPException as e:
+            return self.create_error_response(
+                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+        except ValueError as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="BadRequest",
+                status_code=400,
+            )
+        except Exception as e:
+            return self.create_error_response(
+                message=f"Internal server error: {str(e)}",
+                err_type="InternalServerError",
+                status_code=500,
+            )
 
     async def chat_completion_stream_generator(
         self,

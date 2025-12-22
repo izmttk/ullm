@@ -104,7 +104,7 @@ class LLM:
         # If the request is disconnected by the client, the
         # generate() task will be canceled. So, we abort the
         # request if we end up here.
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             self.abort(sequence_id)
             raise
 

@@ -1,6 +1,7 @@
 import time
 from typing import AsyncGenerator
 
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from .protocol import (
@@ -16,71 +17,91 @@ from .serving_engine import OpenAIServing
 
 class OpenAIServingCompletion(OpenAIServing):
     async def create_completion(self, request: CompletionRequest):
-        if request.echo:
-            return self.create_error_response(400, "echo is not supported")
-        if request.suffix:
-            return self.create_error_response(400, "suffix is not supported")
-        if request.logprobs is not None and request.logprobs > 0:
-            return self.create_error_response(400, "logprobs is not supported")
-        if request.best_of is not None and request.best_of > 1:
-            return self.create_error_response(400, "best_of is not supported")
-        if request.logit_bias:
-            return self.create_error_response(400, "logit_bias is not supported")
-        if request.presence_penalty is not None and request.presence_penalty != 0.0:
-            return self.create_error_response(400, "presence_penalty is not supported")
-        if request.frequency_penalty is not None and request.frequency_penalty != 0.0:
-            return self.create_error_response(400, "frequency_penalty is not supported")
+        try:
+            if request.echo:
+                raise ValueError("echo is not supported")
+            if request.suffix:
+                raise ValueError("suffix is not supported")
+            if request.logprobs is not None and request.logprobs > 0:
+                raise ValueError("logprobs is not supported")
+            if request.best_of is not None and request.best_of > 1:
+                raise ValueError("best_of is not supported")
+            if request.logit_bias:
+                raise ValueError("logit_bias is not supported")
+            if request.presence_penalty is not None and request.presence_penalty != 0.0:
+                raise ValueError("presence_penalty is not supported")
+            if (
+                request.frequency_penalty is not None
+                and request.frequency_penalty != 0.0
+            ):
+                raise ValueError("frequency_penalty is not supported")
 
-        create_time_ns = time.time_ns()
-        create_time_sec = create_time_ns // 1_000_000_000
+            create_time_ns = time.time_ns()
+            create_time_sec = create_time_ns // 1_000_000_000
 
-        request_id = f"cmpl-{create_time_ns}"
+            request_id = f"cmpl-{create_time_ns}"
 
-        if isinstance(request.prompt, list):
-            if len(request.prompt) > 1:
-                return self.create_error_response(400, "Batching is not supported")
-            prompt = request.prompt[0]
-        else:
-            prompt = request.prompt
+            if isinstance(request.prompt, list):
+                if len(request.prompt) > 1:
+                    raise ValueError("Batching is not supported")
+                prompt = request.prompt[0]
+            else:
+                prompt = request.prompt
 
-        sampling_params = self._extract_sampling_params(request)
+            sampling_params = self._extract_sampling_params(request)
 
-        if request.stream:
-            return StreamingResponse(
-                self.completion_stream_generator(
-                    request, prompt, request_id, create_time_sec
-                ),
-                media_type="text/event-stream",
+            if request.stream:
+                return StreamingResponse(
+                    self.completion_stream_generator(
+                        request, prompt, request_id, create_time_sec
+                    ),
+                    media_type="text/event-stream",
+                )
+            (
+                text_outputs,
+                finish_reason,
+                num_prompt_tokens,
+                num_generated_tokens,
+            ) = await self._generate_full(prompt, sampling_params, request_id)
+            assert finish_reason == "stop" or finish_reason == "length"
+
+            choices = [
+                CompletionResponseChoice(
+                    index=i,
+                    text=text_outputs[i],
+                    logprobs=None,
+                    finish_reason=finish_reason,
+                )
+                for i in range(sampling_params.n)
+            ]
+            usage = UsageInfo(
+                prompt_tokens=num_prompt_tokens,
+                completion_tokens=num_generated_tokens,
+                total_tokens=num_prompt_tokens + num_generated_tokens,
             )
-        (
-            text_outputs,
-            finish_reason,
-            num_prompt_tokens,
-            num_generated_tokens,
-        ) = await self._generate_full(prompt, sampling_params, request_id)
-        assert finish_reason == "stop" or finish_reason == "length"
-
-        choices = [
-            CompletionResponseChoice(
-                index=i,
-                text=text_outputs[i],
-                logprobs=None,
-                finish_reason=finish_reason,
+            return CompletionResponse(
+                id=request_id,
+                created=create_time_sec,
+                model=self.model_name,
+                choices=choices,
+                usage=usage,
             )
-            for i in range(sampling_params.n)
-        ]
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
-            total_tokens=num_prompt_tokens + num_generated_tokens,
-        )
-        return CompletionResponse(
-            id=request_id,
-            created=create_time_sec,
-            model=self.model_name,
-            choices=choices,
-            usage=usage,
-        )
+        except HTTPException as e:
+            return self.create_error_response(
+                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+        except ValueError as e:
+            return self.create_error_response(
+                message=str(e),
+                err_type="BadRequest",
+                status_code=400,
+            )
+        except Exception as e:
+            return self.create_error_response(
+                message=f"Internal server error: {str(e)}",
+                err_type="InternalServerError",
+                status_code=500,
+            )
 
     async def completion_stream_generator(
         self,
