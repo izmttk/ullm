@@ -156,17 +156,10 @@ class MultiWorkerClient:
         self.mp_ctx = mp.get_context("spawn")
         self.shutting_down = False
 
-        weak_self = weakref.ref(self)
-
-        def cleanup():
-            self_ref = weak_self()
-            if self_ref and hasattr(self_ref, "workers"):
-                for worker in self_ref.workers:
-                    shutdown(worker.proc)
-
-        self._finalizer = weakref.finalize(self, cleanup)
         self.set_envs()
         self.start_workers()
+        self.start_worker_monitor()
+        self.wait_worker_ready()
 
     def shutdown(self):
         logger.debug(f"Shutting down {self.__class__.__name__}...")
@@ -201,9 +194,9 @@ class MultiWorkerClient:
                 if is_driver_worker:
                     self.driver_worker = worker
                 self.workers.append(worker)
-
-        self.start_worker_monitor()
-        self.wait_worker_ready()
+        self._finalizer = weakref.finalize(
+            self, shutdown, [w.proc for w in self.workers]
+        )
 
     def wait_worker_ready(self):
         logger.debug("Waiting for all workers to be ready...")

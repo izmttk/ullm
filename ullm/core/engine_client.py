@@ -99,21 +99,15 @@ class MpClient:
         self.output_queue = self.mp_ctx.Queue()
         self.engine_dead = False
 
-        weak_self = weakref.ref(self)
-
-        def cleanup():
-            self_ref = weak_self()
-            if self_ref and hasattr(self_ref, "output_queue"):
-                self_ref.output_queue.put_nowait(EngineDeadError())
-            if self_ref and hasattr(self_ref, "engine_process"):
-                shutdown(self_ref.engine_process)
-
-        self._finalizer = weakref.finalize(self, cleanup)
         self.start_engine()
+
+        self.start_engine_monitor()
+        self.wait_engine_ready()
 
     def shutdown(self):
         logger.debug(f"Shutting down {self.__class__.__name__}...")
         self.engine_dead = True
+        self.output_queue.put_nowait(EngineDeadError())
         self._finalizer()
         logger.debug(f"{self.__class__.__name__} shut down.")
 
@@ -132,10 +126,9 @@ class MpClient:
             ),
         )
         self.engine_process.start()
-        logger.debug("Engine process started.")
+        self._finalizer = weakref.finalize(self, shutdown, self.engine_process)
 
-        self.start_engine_monitor()
-        self.wait_engine_ready()
+        logger.debug("Engine process started.")
 
     def wait_engine_ready(self):
         logger.debug("Waiting for engine to be ready...")
