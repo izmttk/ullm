@@ -1,4 +1,5 @@
 import enum
+import logging
 import multiprocessing as mp
 import os
 import queue
@@ -36,7 +37,8 @@ def run_worker_loop(
     output_queue: mp.Queue,
 ):
     report_pipe.send(b"HELLO")
-    logger.setLevel(config.log_level.upper())
+
+    logging.basicConfig(level=config.log_level.upper())
 
     shutdown_requested = False
 

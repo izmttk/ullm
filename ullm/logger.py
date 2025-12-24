@@ -87,7 +87,6 @@ def warning_once(logger: logging.Logger, msg: str, *args) -> None:
 
 def init_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
 
     logger.handlers.clear()
     handler = logging.StreamHandler(sys.stdout)

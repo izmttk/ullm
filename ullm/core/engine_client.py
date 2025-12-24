@@ -1,4 +1,4 @@
-import os
+import logging
 import queue
 import signal
 import threading
@@ -23,7 +23,7 @@ def run_engine_loop(
     output_queue: mp.Queue,
 ):
     report_pipe.send(b"HELLO")
-    logger.setLevel(config.log_level.upper())
+    logging.basicConfig(level=config.log_level.upper())
 
     shutdown_requested = False
 
