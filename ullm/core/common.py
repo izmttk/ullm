@@ -41,6 +41,17 @@ class EngineOutput:
     num_generated_tokens: int
 
 
+class EngineDeadError(Exception):
+    """
+    This exception is used to inform fastapi handlers that engine is dead.
+    """
+
+    MESSAGE = "Engine process has exited unexpectedly."
+
+    def __init__(self, message: str = MESSAGE, *args, **kwargs):
+        super().__init__(message, *args, **kwargs)
+
+
 class SequenceStatus(enum.Enum):
     WAITING = enum.auto()
     RUNNING = enum.auto()

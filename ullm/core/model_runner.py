@@ -359,7 +359,7 @@ class ModelRunner:
         graph_bs = [1, 2, 4, 8] + list(range(16, self.max_bs, 16))
         if self.max_bs not in graph_bs:
             graph_bs.append(self.max_bs)
-        logger.info("Capturing CUDA graphs for batch sizes:", graph_bs)
+        logger.info(f"Capturing CUDA graphs for batch sizes:0 {graph_bs}")
 
         self.attn_backend.prepare_for_cuda_graph_capture(
             graph=self.cuda_graph,
@@ -405,6 +405,8 @@ class ModelRunner:
             for name, tesor in hidden_states.items():
                 self.cuda_graph.set_output_buffer(name, tesor)
 
+        compiled_model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")
+
         # Capture graphs for different batch sizes
         for bs in reversed(graph_bs):
             attention_metadata = (
@@ -427,9 +429,6 @@ class ModelRunner:
             )
 
             with attention_kv_cache(self.model, attention_metadata):
-                compiled_model = torch.compile(
-                    self.model, mode="max-autotune-no-cudagraphs"
-                )
                 # Warmup before capture
                 output = compiled_model(
                     bs_input_ids, bs_positions, bs_intermediate_tensors
@@ -444,3 +443,5 @@ class ModelRunner:
                         for name, buffer in hidden_states.items():
                             buffer[:bs] = output[name]
             torch.cuda.synchronize()
+
+        torch.compiler.reset()

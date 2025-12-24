@@ -1,6 +1,6 @@
+import json
+from http import HTTPStatus
 from typing import Union
-
-from fastapi.responses import JSONResponse
 
 from ..core.common import SamplingParams
 from ..llm import LLM
@@ -36,11 +36,26 @@ class OpenAIServing:
                 num_generated_tokens = res.num_generated_tokens
         return text_outputs, finish_reason, num_prompt_tokens, num_generated_tokens
 
-    def create_error_response(self, status_code: int, message: str) -> JSONResponse:
-        return JSONResponse(
-            ErrorResponse(message=message, type="invalid_request_error").model_dump(),
-            status_code=status_code,
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+    ) -> ErrorResponse:
+        return ErrorResponse(message=message, type=err_type, code=status_code.value)
+
+    def create_streaming_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+    ) -> str:
+        json_str = json.dumps(
+            self.create_error_response(
+                message=message, err_type=err_type, status_code=status_code
+            ).model_dump()
         )
+        return json_str
 
     def _extract_sampling_params(
         self, request: Union[CompletionRequest, ChatCompletionRequest]

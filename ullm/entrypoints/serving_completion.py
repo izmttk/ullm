@@ -1,8 +1,8 @@
 import time
+from http import HTTPStatus
 from typing import AsyncGenerator
 
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .protocol import (
     CompletionRequest,
@@ -86,21 +86,23 @@ class OpenAIServingCompletion(OpenAIServing):
                 choices=choices,
                 usage=usage,
             )
-        except HTTPException as e:
-            return self.create_error_response(
-                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
-            )
         except ValueError as e:
-            return self.create_error_response(
-                message=str(e),
-                err_type="BadRequest",
-                status_code=400,
+            return JSONResponse(
+                content=self.create_error_response(
+                    message=str(e),
+                    err_type="BadRequest",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                ).model_dump(),
+                status_code=HTTPStatus.BAD_REQUEST.value,
             )
         except Exception as e:
-            return self.create_error_response(
-                message=f"Internal server error: {str(e)}",
-                err_type="InternalServerError",
-                status_code=500,
+            return JSONResponse(
+                content=self.create_error_response(
+                    message=f"Internal server error: {str(e)}",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                ).model_dump(),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
             )
 
     async def completion_stream_generator(
@@ -110,29 +112,11 @@ class OpenAIServingCompletion(OpenAIServing):
         request_id: str,
         created: int,
     ) -> AsyncGenerator[str, None]:
-        sampling_params = self._extract_sampling_params(request)
-        for i in range(sampling_params.n):
-            choice_data = CompletionResponseStreamChoice(
-                index=i, text="", logprobs=None, finish_reason=None
-            )
-            chunk = CompletionStreamResponse(
-                id=request_id,
-                object="text_completion",
-                created=created,
-                choices=[choice_data],
-                model=self.model_name,
-            )
-            data = chunk.model_dump_json(exclude_unset=True)
-            yield f"data: {data}\n\n"
-
-        finish_reason = None
-        async for output in self.engine.generate(prompt, sampling_params, request_id):
+        try:
+            sampling_params = self._extract_sampling_params(request)
             for i in range(sampling_params.n):
-                text = output.token_str
-                if output.is_finished:
-                    finish_reason = output.finish_reason
                 choice_data = CompletionResponseStreamChoice(
-                    index=i, text=text, logprobs=None, finish_reason=None
+                    index=i, text="", logprobs=None, finish_reason=None
                 )
                 chunk = CompletionStreamResponse(
                     id=request_id,
@@ -144,21 +128,48 @@ class OpenAIServingCompletion(OpenAIServing):
                 data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
 
-        assert finish_reason is not None
-        finish_reason = finish_reason.name.lower()
-        assert finish_reason == "stop" or finish_reason == "length"
+            finish_reason = None
+            async for output in self.engine.generate(
+                prompt, sampling_params, request_id
+            ):
+                for i in range(sampling_params.n):
+                    text = output.token_str
+                    if output.is_finished:
+                        finish_reason = output.finish_reason
+                    choice_data = CompletionResponseStreamChoice(
+                        index=i, text=text, logprobs=None, finish_reason=None
+                    )
+                    chunk = CompletionStreamResponse(
+                        id=request_id,
+                        object="text_completion",
+                        created=created,
+                        choices=[choice_data],
+                        model=self.model_name,
+                    )
+                    data = chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
 
-        for i in range(sampling_params.n):
-            choice_data = CompletionResponseStreamChoice(
-                index=i, text="", logprobs=None, finish_reason=finish_reason
+            assert finish_reason is not None
+            finish_reason = finish_reason.name.lower()
+            assert finish_reason == "stop" or finish_reason == "length"
+
+            for i in range(sampling_params.n):
+                choice_data = CompletionResponseStreamChoice(
+                    index=i, text="", logprobs=None, finish_reason=finish_reason
+                )
+                chunk = CompletionStreamResponse(
+                    id=request_id,
+                    object="text_completion",
+                    created=created,
+                    choices=[choice_data],
+                    model=self.model_name,
+                )
+                data = chunk.model_dump_json(exclude_unset=True)
+                yield f"data: {data}\n\n"
+        except Exception as e:
+            data = self.create_streaming_error_response(
+                message=f"Internal server error: {str(e)}",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-            chunk = CompletionStreamResponse(
-                id=request_id,
-                object="text_completion",
-                created=created,
-                choices=[choice_data],
-                model=self.model_name,
-            )
-            data = chunk.model_dump_json(exclude_unset=True)
             yield f"data: {data}\n\n"
         yield "data: [DONE]\n\n"

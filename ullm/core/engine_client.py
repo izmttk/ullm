@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 from ..config import EngineConfig
 from ..logger import init_logger
 from ..utils import shutdown
-from .common import EngineOutput, SamplingParams
+from .common import EngineDeadError, EngineOutput, SamplingParams
 from .engine import Engine
 
 logger = init_logger(__name__)
@@ -97,16 +97,14 @@ class MpClient:
         self.mp_ctx = mp.get_context("spawn")
         self.input_queue = self.mp_ctx.Queue()
         self.output_queue = self.mp_ctx.Queue()
-        self.shutting_down = False
+        self.engine_dead = False
 
         weak_self = weakref.ref(self)
 
         def cleanup():
             self_ref = weak_self()
-            if self_ref and hasattr(self_ref, "input_queue"):
-                self_ref.input_queue.close()
             if self_ref and hasattr(self_ref, "output_queue"):
-                self_ref.output_queue.close()
+                self_ref.output_queue.put_nowait(EngineDeadError())
             if self_ref and hasattr(self_ref, "engine_process"):
                 shutdown(self_ref.engine_process)
 
@@ -115,7 +113,7 @@ class MpClient:
 
     def shutdown(self):
         logger.debug(f"Shutting down {self.__class__.__name__}...")
-        self.shutting_down = True
+        self.engine_dead = True
         self._finalizer()
         logger.debug(f"{self.__class__.__name__} shut down.")
 
@@ -141,7 +139,7 @@ class MpClient:
 
     def wait_engine_ready(self):
         logger.debug("Waiting for engine to be ready...")
-        while not self.shutting_down:
+        while not self.engine_dead:
             for conn in wait([self.report_pipe], timeout=1.0):
                 assert isinstance(conn, Connection)
                 msg = conn.recv()
@@ -166,7 +164,7 @@ class MpClient:
         def run_monitor():
             _died = wait([self.engine_process.sentinel])
             self_ref = weak_self()
-            if not self_ref or self_ref.shutting_down:
+            if not self_ref or self_ref.engine_dead:
                 return
             logger.error("Engine process has exited unexpectedly.")
             self_ref.shutdown()
@@ -188,12 +186,21 @@ class EngineClient(MpClient):
         prompt_token_ids: list[int],
         sampling_params: SamplingParams,
     ):
+        if self.engine_dead:
+            raise EngineDeadError()
         self.input_queue.put_nowait(
             ("add_sequence", (sequence_id, prompt_token_ids, sampling_params), {})
         )
 
     def abort_sequence(self, sequence_id: str):
+        if self.engine_dead:
+            raise EngineDeadError()
         self.input_queue.put_nowait(("abort_sequence", (sequence_id,), {}))
 
     def get_output(self, timeout: float | None) -> list[EngineOutput]:
-        return self.output_queue.get(timeout=timeout)
+        outputs = self.output_queue.get(timeout=timeout)
+        # raise an exception if engine process has died
+        # this will help server to shutdown automatically
+        if isinstance(outputs, Exception):
+            raise outputs
+        return outputs

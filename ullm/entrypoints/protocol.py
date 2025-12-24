@@ -16,7 +16,7 @@ class ErrorResponse(BaseModel):
     message: str
     type: str
     param: Optional[str] = None
-    code: Optional[str] = None
+    code: int
 
 
 # Models for root endpoint

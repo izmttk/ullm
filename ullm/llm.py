@@ -26,42 +26,51 @@ class LLM:
         self.engine = EngineClient(config)
         self.tokenizer = init_tokenizer(config.model)
 
-        self.request_states: dict[str, asyncio.Queue[GenerateOutput | None]] = {}
+        self.request_states: dict[
+            str, asyncio.Queue[GenerateOutput | Exception | None]
+        ] = {}
         self.output_processor_task = asyncio.create_task(self.output_processor())
 
     async def output_processor(self):
-        while True:
-            try:
-                outputs = await asyncio.to_thread(self.engine.get_output, timeout=0.1)
-            except queue.Empty:
-                continue
-            for output in outputs:
-                seq_id = output.seq_id
-                new_token_id = output.new_token_id
-                if seq_id in self.request_states:
-                    q = self.request_states[seq_id]
-                    token_str = self.detokenize([[new_token_id]])[0]
-                    if output.is_finished:
-                        q.put_nowait(
-                            GenerateOutput(
-                                token_str=token_str,
-                                is_finished=True,
-                                finish_reason=output.finish_reason,
-                                num_prompt_tokens=output.num_prompt_tokens,
-                                num_generated_tokens=output.num_generated_tokens,
+        try:
+            while True:
+                try:
+                    outputs = await asyncio.to_thread(
+                        self.engine.get_output, timeout=0.1
+                    )
+                except queue.Empty:
+                    continue
+                for output in outputs:
+                    seq_id = output.seq_id
+                    new_token_id = output.new_token_id
+                    if seq_id in self.request_states:
+                        q = self.request_states[seq_id]
+                        token_str = self.detokenize([[new_token_id]])[0]
+                        if output.is_finished:
+                            q.put_nowait(
+                                GenerateOutput(
+                                    token_str=token_str,
+                                    is_finished=True,
+                                    finish_reason=output.finish_reason,
+                                    num_prompt_tokens=output.num_prompt_tokens,
+                                    num_generated_tokens=output.num_generated_tokens,
+                                )
                             )
-                        )
-                        q.put_nowait(None)  # Sentinel for end of generation
-                    else:
-                        q.put_nowait(
-                            GenerateOutput(
-                                token_str=token_str,
-                                is_finished=False,
-                                finish_reason=None,
-                                num_prompt_tokens=0,
-                                num_generated_tokens=0,
+                            q.put_nowait(None)  # Sentinel for end of generation
+                        else:
+                            q.put_nowait(
+                                GenerateOutput(
+                                    token_str=token_str,
+                                    is_finished=False,
+                                    finish_reason=None,
+                                    num_prompt_tokens=0,
+                                    num_generated_tokens=0,
+                                )
                             )
-                        )
+        except Exception as e:
+            # propagate the exception to all pending requests (generate tasks)
+            for q in self.request_states.values():
+                q.put_nowait(e)
 
     def tokenize(self, texts: list[str]) -> list[list[int]]:
         return self.tokenizer(texts)["input_ids"]  # type: ignore
@@ -82,7 +91,7 @@ class LLM:
                 token_ids = prompts
             else:
                 token_ids = self.tokenize([prompts])[0]
-            q: asyncio.Queue[GenerateOutput | None] = asyncio.Queue()
+            q: asyncio.Queue[GenerateOutput | Exception | None] = asyncio.Queue()
 
             if params.eos_token_id == -1:
                 params.eos_token_id = self.tokenizer.eos_token_id  # type: ignore
@@ -96,6 +105,8 @@ class LLM:
 
             while True:
                 output = await q.get()
+                if isinstance(output, Exception):
+                    raise output
                 if output is None:  # End of generation
                     break
                 yield output
