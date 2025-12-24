@@ -31,6 +31,7 @@ class EngineConfig:
             device_ids=device_ids,
             enforce_eager=args.enforce_eager,
             context_len=args.context_len,
+            log_level=args.log_level,
         )
 
 

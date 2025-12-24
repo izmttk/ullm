@@ -5,7 +5,9 @@ https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/api_serve
 
 import argparse
 import gc
+import logging
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 
 import fastapi
 import uvicorn
@@ -55,16 +57,16 @@ async def lifespan(app: fastapi.FastAPI):
 app = fastapi.FastAPI(lifespan=lifespan)
 
 
-def create_error_response(status_code: int, message: str) -> JSONResponse:
-    return JSONResponse(
-        ErrorResponse(message=message, type="invalid_request_error").dict(),
-        status_code=status_code,
-    )
-
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: fastapi.Request, exc):  # pylint: disable=unused-argument
-    return create_error_response(400, str(exc))
+    return JSONResponse(
+        ErrorResponse(
+            message=str(exc),
+            type="invalid_request_error",
+            code=HTTPStatus.BAD_REQUEST.value,
+        ).model_dump(),
+        status_code=HTTPStatus.BAD_REQUEST.value,
+    )
 
 
 @app.get("/v1/models")
@@ -130,6 +132,9 @@ def run_server(args: argparse.Namespace):
     )
 
     server_config = ServerConfig.from_args(args)
+    log_level = args.log_level
+    if log_level not in logging.getLevelNamesMapping():
+        raise ValueError(f"Invalid log level: {log_level}")
 
     # HACK: Patch uvicorn server to handle force exit properly
     patch_uvicorn_server()
@@ -137,7 +142,7 @@ def run_server(args: argparse.Namespace):
         app,
         host=server_config.host,
         port=server_config.port,
-        log_level="debug",
+        log_level=log_level,
         timeout_keep_alive=server_config.timeout_keep_alive,
     )
 
@@ -177,6 +182,12 @@ if __name__ == "__main__":
         "--enforce-eager",
         action="store_true",
         help="Enforce eager execution, disable CUDA graph",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Log level for the engine",
     )
     args = parser.parse_args()
 
