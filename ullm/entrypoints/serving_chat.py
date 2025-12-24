@@ -174,6 +174,7 @@ class OpenAIServingChat(OpenAIServing):
         except Exception as e:
             data = self.create_streaming_error_response(
                 message=f"Internal server error: {str(e)}",
+                err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             yield f"data: {data}\n\n"

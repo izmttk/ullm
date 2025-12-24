@@ -14,7 +14,7 @@ class EngineConfig:
     enforce_eager: bool = False
     context_len: int = 2048
 
-    log_level: str = "INFO"
+    log_level: str = "info"
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "EngineConfig":

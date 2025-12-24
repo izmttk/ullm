@@ -36,7 +36,7 @@ def run_worker_loop(
     output_queue: mp.Queue,
 ):
     report_pipe.send(b"HELLO")
-    logger.setLevel(config.log_level)
+    logger.setLevel(config.log_level.upper())
 
     shutdown_requested = False
 

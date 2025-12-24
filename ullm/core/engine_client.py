@@ -22,12 +22,8 @@ def run_engine_loop(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
 ):
-    # Prevent SIGINT from propagating to the engine process
-    # This allows the main process to handle shutdown manually
-    os.setsid()
-
     report_pipe.send(b"HELLO")
-    logger.setLevel(config.log_level)
+    logger.setLevel(config.log_level.upper())
 
     shutdown_requested = False
 
@@ -91,7 +87,7 @@ def run_engine_loop(
 
 class MpClient:
     def __init__(self, config: EngineConfig):
-        logger.setLevel(config.log_level)
+        logger.setLevel(config.log_level.upper())
 
         self.config = config
         self.mp_ctx = mp.get_context("spawn")
