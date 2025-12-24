@@ -346,6 +346,16 @@ class KVCacheManager:
     def free_slots(self, indices: abc.Iterable[int]):
         self.kv_cache_allocator.free(indices)
 
+    def match_prefix(self, seq: Sequence):
+        # We need to reserve as least one token for model's input
+        key = seq.token_ids[: len(seq.token_ids) - 1]
+        cache_indices, last_node = self.radix_tree.match_prefix(key)
+        if cache_indices:
+            seq.kv_indices = cache_indices
+            seq.cached_kv_len = len(cache_indices)
+            self.radix_tree.inc_ref(last_node)
+            self.unfinished_sequences[seq.seq_id] = (len(cache_indices), last_node)
+
     def cache_sequence(self, seq: Sequence):
         token_ids = seq.token_ids
         kv_indices = seq.kv_indices

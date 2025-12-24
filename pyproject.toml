@@ -14,10 +14,10 @@ authors = [{ name = "izmttk" }]
 dependencies = [
     "torch>=2.8.0",
     "triton>=3.0.0",
-    "transformers>=4.51.0",
+    "transformers>=4.51.0,<=4.57.3",
     "fastapi>=0.95.0",
     "uvicorn",
-    "flashinfer-python>=0.2.0",
+    "flashinfer-python>=0.2.7",
     "psutil",
 ]
 

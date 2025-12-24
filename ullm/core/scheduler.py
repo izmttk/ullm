@@ -67,6 +67,8 @@ class Scheduler:
         # Prefill-first: schedule waiting sequences if any
         while self.waiting and len(batch) < self.max_bs:
             seq = self.waiting.popleft()
+            # match prefix from KV cache on scheduling time
+            self.kv_manager.match_prefix(seq)
             # Mark as running when scheduled for its first prefill
             seq.status = SequenceStatus.RUNNING
             self.alloc_kv_slots(seq)
