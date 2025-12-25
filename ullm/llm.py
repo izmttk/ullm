@@ -1,5 +1,4 @@
 import asyncio
-import queue
 import uuid
 from typing import AsyncGenerator
 
@@ -34,12 +33,7 @@ class LLM:
     async def output_processor(self):
         try:
             while True:
-                try:
-                    outputs = await asyncio.to_thread(
-                        self.engine.get_output, timeout=0.1
-                    )
-                except queue.Empty:
-                    continue
+                outputs = await asyncio.to_thread(self.engine.get_output)
                 for output in outputs:
                     seq_id = output.seq_id
                     new_token_id = output.new_token_id

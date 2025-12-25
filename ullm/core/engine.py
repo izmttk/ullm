@@ -1,5 +1,6 @@
 import queue
 from concurrent.futures import Future
+from typing import Callable
 
 from ..config import EngineConfig
 from ..logger import init_logger
@@ -18,9 +19,12 @@ class Engine:
     def __init__(
         self,
         config: EngineConfig,
+        failure_callback: Callable[[], None] | None = None,
     ):
         self.config = config
         self.model_executor = Executor(config=self.config)
+        if failure_callback:
+            self.model_executor.on_failure(failure_callback)
         self.model_executor.initialize()
         kv_cache_size = self.model_executor.get_kv_cache_size()
         self.scheduler = Scheduler(

@@ -1,8 +1,11 @@
+import enum
 import logging
 import queue
 import signal
 import threading
+import time
 import weakref
+from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 
 import torch.multiprocessing as mp
@@ -16,31 +19,62 @@ from .engine import Engine
 logger = init_logger(__name__)
 
 
+class EngineEventType(enum.Enum):
+    STARTUP = enum.auto()
+    READY = enum.auto()
+    SHUTDOWN = enum.auto()
+    ERROR = enum.auto()
+    DEAD = enum.auto()
+
+
+@dataclass
+class EngineEvent:
+    type: EngineEventType
+
+
 def run_engine_loop(
     config: EngineConfig,
     report_pipe: Connection,
     input_queue: mp.Queue,
     output_queue: mp.Queue,
 ):
-    report_pipe.send(b"HELLO")
+    report_pipe.send(EngineEvent(EngineEventType.STARTUP))
     logging.basicConfig(level=config.log_level.upper())
 
     shutdown_requested = False
 
     def signal_handler(signum, frame):
-        nonlocal shutdown_requested
         if not shutdown_requested:
-            shutdown_requested = True
             raise SystemExit()
 
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
     engine: Engine | None = None
+    heartbeat_thread: threading.Thread | None = None
+    engine_failed = False
     try:
-        engine = Engine(config=config)
-        report_pipe.send(b"READY")
+
+        def failure_callback():
+            nonlocal engine_failed
+            engine_failed = True
+
+        engine = Engine(config=config, failure_callback=failure_callback)
+
+        def heartbeat_loop():
+            while not shutdown_requested:
+                try:
+                    report_pipe.send(EngineEvent(EngineEventType.READY))
+                except (BrokenPipeError, OSError):
+                    break  # 管道已关闭，退出心跳线程
+                time.sleep(5)
+
+        heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+
         while True:
+            if engine_failed:
+                raise RuntimeError("Engine has encountered a fatal error.")
             # 如果 engine 中没有未完成的请求了，即 engine 的 waiting 和 running 队列都空了
             # 则在调用下一次 step 之前，阻塞等待一个新的请求
             if not engine.has_unfinished_sequences():
@@ -69,17 +103,29 @@ def run_engine_loop(
             if outputs:
                 output_queue.put_nowait(outputs)
     except SystemExit:
-        report_pipe.send(b"EXIT")
+        shutdown_requested = True
         logger.debug("Engine process exit.")
         raise
     except Exception:
-        report_pipe.send(b"ERROR")
+        shutdown_requested = True
+        if heartbeat_thread and heartbeat_thread.is_alive():
+            heartbeat_thread.join()
+        try:
+            report_pipe.send(EngineEvent(EngineEventType.ERROR))
+        except (BrokenPipeError, OSError):
+            pass  # 管道已关闭是正常的
         if not engine:
             logger.exception("Engine initialization failed.")
         else:
             logger.exception("Engine encountered an error.")
-        raise
     finally:
+        shutdown_requested = True
+        if heartbeat_thread and heartbeat_thread.is_alive():
+            heartbeat_thread.join()
+        try:
+            report_pipe.send(EngineEvent(EngineEventType.SHUTDOWN))
+        except (BrokenPipeError, OSError):
+            pass  # 管道已关闭是正常的
         if engine:
             engine.shutdown()
             logger.debug("Engine has been shut down.")
@@ -93,17 +139,14 @@ class MpClient:
         self.mp_ctx = mp.get_context("spawn")
         self.input_queue = self.mp_ctx.Queue()
         self.output_queue = self.mp_ctx.Queue()
-        self.engine_dead = False
+        self.is_dead = False
 
         self.start_engine()
-
         self.start_engine_monitor()
         self.wait_engine_ready()
 
     def shutdown(self):
         logger.debug(f"Shutting down {self.__class__.__name__}...")
-        self.engine_dead = True
-        self.output_queue.put_nowait(EngineDeadError())
         self._finalizer()
         logger.debug(f"{self.__class__.__name__} shut down.")
 
@@ -128,21 +171,17 @@ class MpClient:
 
     def wait_engine_ready(self):
         logger.debug("Waiting for engine to be ready...")
-        while not self.engine_dead:
-            for conn in wait([self.report_pipe], timeout=1.0):
-                assert isinstance(conn, Connection)
-                msg = conn.recv()
-                if msg == b"HELLO":
-                    continue
-                elif msg == b"READY":
-                    logger.debug("Engine process is ready.")
-                    return
-                elif msg == b"EXIT":
-                    raise RuntimeError("Engine process exited during startup.")
-                elif msg == b"ERROR":
-                    raise RuntimeError(
-                        "Engine process encountered an error during startup."
-                    )
+        while True:
+            event: EngineEvent = self.report_pipe.recv()
+            if event.type == EngineEventType.STARTUP:
+                continue
+            elif event.type == EngineEventType.READY:
+                break
+            else:
+                raise RuntimeError(
+                    "Engine process encountered an error during startup."
+                )
+        logger.debug("Engine process is ready.")
 
     def start_engine_monitor(self):
         if not hasattr(self, "engine_process") or not self.engine_process:
@@ -150,21 +189,22 @@ class MpClient:
         # Avoid circular references
         weak_self = weakref.ref(self)
 
-        def run_monitor():
+        def engine_dead_monitor():
             _died = wait([self.engine_process.sentinel])
             self_ref = weak_self()
-            if not self_ref or self_ref.engine_dead:
+            if not self_ref:
                 return
-            logger.error("Engine process has exited unexpectedly.")
+            logger.debug("Engine process has died.")
+            self_ref.is_dead = True
             self_ref.shutdown()
 
         logger.debug("Starting engine monitor thread...")
-        self.monitor_thread = threading.Thread(
-            target=run_monitor,
-            name="engine-monitor",
+        self.dead_monitor_thread = threading.Thread(
+            target=engine_dead_monitor,
+            name="engine-dead-monitor",
             daemon=True,
         )
-        self.monitor_thread.start()
+        self.dead_monitor_thread.start()
         logger.debug("Engine monitor thread started.")
 
 
@@ -175,21 +215,26 @@ class EngineClient(MpClient):
         prompt_token_ids: list[int],
         sampling_params: SamplingParams,
     ):
-        if self.engine_dead:
+        if self.is_dead:
             raise EngineDeadError()
         self.input_queue.put_nowait(
             ("add_sequence", (sequence_id, prompt_token_ids, sampling_params), {})
         )
 
     def abort_sequence(self, sequence_id: str):
-        if self.engine_dead:
+        if self.is_dead:
             raise EngineDeadError()
         self.input_queue.put_nowait(("abort_sequence", (sequence_id,), {}))
 
-    def get_output(self, timeout: float | None) -> list[EngineOutput]:
-        outputs = self.output_queue.get(timeout=timeout)
-        # raise an exception if engine process has died
-        # this will help server to shutdown automatically
-        if isinstance(outputs, Exception):
-            raise outputs
+    def get_output(self) -> list[EngineOutput]:
+        while True:
+            # raise an exception if engine process has died
+            # this will help server to shutdown automatically
+            if self.is_dead:
+                raise EngineDeadError()
+            try:
+                outputs = self.output_queue.get(timeout=1.0)
+                break
+            except queue.Empty:
+                continue
         return outputs

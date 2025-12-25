@@ -5,12 +5,15 @@ import os
 import queue
 import signal
 import threading
+import time
+import traceback
 import uuid
 import weakref
 from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
+from typing import Callable
 
 from ..config import EngineConfig
 from ..core.worker import Worker
@@ -22,8 +25,22 @@ logger = init_logger(__name__)
 
 
 class ResponseStatus(enum.Enum):
-    SUCCESS = 0
-    ERROR = 1
+    SUCCESS = enum.auto()
+    FAILED = enum.auto()
+
+
+class WorkerEventType(enum.Enum):
+    STARTUP = enum.auto()
+    READY = enum.auto()
+    SHUTDOWN = enum.auto()
+    ERROR = enum.auto()
+    DEAD = enum.auto()
+
+
+@dataclass
+class WorkerEvent:
+    rank: int
+    type: WorkerEventType
 
 
 def run_worker_loop(
@@ -36,28 +53,37 @@ def run_worker_loop(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
 ):
-    report_pipe.send(b"HELLO")
+    report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.STARTUP))
 
     logging.basicConfig(level=config.log_level.upper())
 
     shutdown_requested = False
 
     def signal_handler(signum, frame):
-        nonlocal shutdown_requested
         if not shutdown_requested:
-            shutdown_requested = True
             raise SystemExit()
 
     # Either SIGTERM or SIGINT will terminate the worker
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    worker = None
+    worker: Worker | None = None
+    heartbeat_thread: threading.Thread | None = None
     try:
         worker = Worker(config=config, rank=rank, tp_rank=tp_rank, pp_rank=pp_rank)
         worker.init_environment()
 
-        report_pipe.send(b"READY")
+        def heartbeat_loop():
+            while not shutdown_requested:
+                try:
+                    report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.READY))
+                except (BrokenPipeError, OSError):
+                    break  # 管道已关闭，退出心跳线程
+                time.sleep(5)
+
+        heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+
         while True:
             try:
                 msg = input_queue.get(timeout=0.1)  # 等待输入
@@ -70,18 +96,29 @@ def run_worker_loop(
             if is_driver_worker:
                 output_queue.put_nowait((request_id, status, resp))
     except SystemExit:
-        report_pipe.send(b"EXIT")
+        shutdown_requested = True
         logger.debug(f"Worker {rank} process exit.")
         raise
     except Exception:
-        report_pipe.send(b"ERROR")
+        shutdown_requested = True
+        if heartbeat_thread and heartbeat_thread.is_alive():
+            heartbeat_thread.join()
+        try:
+            report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.ERROR))
+        except (BrokenPipeError, OSError):
+            pass  # 管道已关闭是正常的
         if not worker:
             logger.exception(f"Worker {rank} initialization failed.")
         else:
             logger.exception(f"Worker {rank} encountered an error.")
-        shutdown_requested = True
-        raise
     finally:
+        shutdown_requested = True
+        if heartbeat_thread and heartbeat_thread.is_alive():
+            heartbeat_thread.join()
+        try:
+            report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.SHUTDOWN))
+        except (BrokenPipeError, OSError):
+            pass  # 管道已关闭是正常的
         if worker:
             worker.destroy_environment()
 
@@ -90,15 +127,16 @@ def handle_rpc_request(worker: Worker, method_name: str, *args, **kwargs):
     # 查找并调用注册的方法
     method = getattr(worker, method_name, None) if method_name else None
     method = method if callable(method) else None
-    if method:
-        try:
+    try:
+        if method:
             result = method(*args, **kwargs)
             return ResponseStatus.SUCCESS, result
-        except Exception as e:
-            return ResponseStatus.ERROR, str(e)
-    else:
-        # 方法不存在
-        return ResponseStatus.ERROR, f"Unknown method: {method_name}"
+        else:
+            # 方法不存在
+            raise ValueError(f"Unknown method: {method_name}")
+    except Exception as e:
+        e.add_note(traceback.format_exc())
+        return ResponseStatus.FAILED, e
 
 
 @dataclass
@@ -156,16 +194,43 @@ class MultiWorkerClient:
         self.driver_worker: WorkerProc
 
         self.mp_ctx = mp.get_context("spawn")
-        self.shutting_down = False
+
+        self.callbacks: dict[WorkerEventType, list[Callable[[WorkerEvent], None]]] = {
+            type: [] for type in WorkerEventType
+        }
+        self.callbacks_lock = threading.Lock()
+
+        self.is_dead = False
 
         self.set_envs()
         self.start_workers()
         self.start_worker_monitor()
         self.wait_worker_ready()
 
+    def add_worker_event_listener(
+        self, event_type: WorkerEventType, callback: Callable[[WorkerEvent], None]
+    ):
+        if event_type in self.callbacks:
+            self.callbacks_lock.acquire()
+            self.callbacks[event_type].append(callback)
+            self.callbacks_lock.release()
+
+    def remove_worker_event_listener(
+        self, event_type: WorkerEventType, callback: Callable[[WorkerEvent], None]
+    ):
+        if event_type in self.callbacks:
+            self.callbacks_lock.acquire()
+            self.callbacks[event_type].remove(callback)
+            self.callbacks_lock.release()
+
+    def on_failure(self, callback: Callable[[], None]):
+        self.add_worker_event_listener(
+            WorkerEventType.DEAD,
+            lambda event: callback(),
+        )
+
     def shutdown(self):
         logger.debug(f"Shutting down {self.__class__.__name__}...")
-        self.shutting_down = True
         self._finalizer()
         logger.debug(f"{self.__class__.__name__} shut down.")
 
@@ -202,48 +267,95 @@ class MultiWorkerClient:
 
     def wait_worker_ready(self):
         logger.debug("Waiting for all workers to be ready...")
-        unready = [w.report_pipe for w in self.workers]
-        while not self.shutting_down and unready:
-            for conn in wait(unready):
-                assert isinstance(conn, Connection)
-                msg = conn.recv()
-                if msg == b"HELLO":
-                    continue
-                elif msg == b"READY":
-                    unready.remove(conn)
-                    continue
-                elif msg == b"EXIT":
-                    unready.remove(conn)
-                    continue
-                elif msg == b"ERROR":
-                    raise RuntimeError(
-                        "Worker process encountered an error during startup."
-                    )
+        unready = [w.rank for w in self.workers]
+        q: queue.Queue[WorkerEvent] = queue.Queue()
+        dead_event = threading.Event()
+
+        def ready_callback(event: WorkerEvent):
+            q.put(event)
+
+        def dead_callback(event: WorkerEvent):
+            dead_event.set()
+
+        self.add_worker_event_listener(WorkerEventType.READY, ready_callback)
+        self.add_worker_event_listener(WorkerEventType.DEAD, dead_callback)
+
+        while unready:
+            if dead_event.is_set():
+                raise RuntimeError(
+                    "Worker process encountered an error during startup."
+                )
+            try:
+                event = q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if event.rank in unready:
+                unready.remove(event.rank)
+
+        self.remove_worker_event_listener(WorkerEventType.READY, ready_callback)
+        self.remove_worker_event_listener(WorkerEventType.DEAD, dead_callback)
         logger.debug("All workers are ready.")
 
     def start_worker_monitor(self):
         workers = self.workers
         weak_self = weakref.ref(self)
 
-        def worker_monitor():
+        def worker_dead_monitor():
             sentinels = [w.proc.sentinel for w in workers]
             died = wait(sentinels)
             dead_worker = next(w for w in workers if w.proc.sentinel == died[0])
             self_ref = weak_self()
-            if not self_ref or self_ref.shutting_down:
+            if not self_ref:
                 return
-            logger.error(
-                f"Worker process {dead_worker.proc.name} has exited unexpectedly."
+            logger.debug(
+                f"Worker {dead_worker.rank} event triggered: {WorkerEventType.DEAD}."
             )
+            self_ref.callbacks_lock.acquire()
+            callbacks = list(self_ref.callbacks[WorkerEventType.DEAD])
+            self_ref.callbacks_lock.release()
+            for callback in callbacks:
+                callback(
+                    WorkerEvent(
+                        rank=dead_worker.rank,
+                        type=WorkerEventType.DEAD,
+                    )
+                )
+            self_ref.is_dead = True
             self_ref.shutdown()
 
+        def worker_event_monitor():
+            conns = [w.report_pipe for w in workers]
+            while True:
+                for conn in wait(conns, timeout=1.0):
+                    assert isinstance(conn, Connection)
+                    try:
+                        event = conn.recv()
+                        assert isinstance(event, WorkerEvent)
+                    except (EOFError, OSError):
+                        continue
+                    self_ref = weak_self()
+                    if not self_ref:
+                        return
+                    logger.debug(f"Worker {event.rank} event triggered: {event.type}.")
+                    self_ref.callbacks_lock.acquire()
+                    callbacks = list(self_ref.callbacks[event.type])
+                    self_ref.callbacks_lock.release()
+                    for callback in callbacks:
+                        callback(event)
+
         logger.debug("Starting worker monitor thread...")
-        self.monitor_thread = threading.Thread(
-            target=worker_monitor,
-            name="worker-monitor",
+        self.dead_monitor_thread = threading.Thread(
+            target=worker_dead_monitor,
+            name="worker-dead-monitor",
             daemon=True,
         )
-        self.monitor_thread.start()
+        self.dead_monitor_thread.start()
+        self.event_monitor_thread = threading.Thread(
+            target=worker_event_monitor,
+            name="worker-event-monitor",
+            daemon=True,
+        )
+        self.event_monitor_thread.start()
         logger.debug("Worker monitor thread started.")
 
 
@@ -257,7 +369,7 @@ class Executor(MultiWorkerClient):
         self.collect_thread.start()
 
     def _collect_loop(self):
-        while True:
+        while not self.is_dead:
             try:
                 msg = self.driver_worker.output_queue.get(timeout=0.1)
             except queue.Empty:
@@ -267,10 +379,12 @@ class Executor(MultiWorkerClient):
             if future:
                 if status == ResponseStatus.SUCCESS:
                     future.set_result(resp)
-                elif status == ResponseStatus.ERROR:
-                    future.set_exception(Exception(resp))
+                elif status == ResponseStatus.FAILED:
+                    future.set_exception(resp)
 
     def submit(self, method, *args, **kwargs):
+        if self.is_dead:
+            raise RuntimeError("Executor has died.")
         future = Future()
         request_id = uuid.uuid4().hex
         for worker in self.workers:
