@@ -4,8 +4,11 @@ import sys
 import threading
 import time
 from multiprocessing.process import BaseProcess
+from typing import Sequence
 
 import psutil
+import zmq
+import zmq.asyncio
 
 
 def kill_process_tree(
@@ -70,3 +73,21 @@ def shutdown(procs: list[BaseProcess] | BaseProcess):
     for proc in proc_list:
         if proc.is_alive() and (pid := proc.pid) is not None:
             kill_process_tree(pid)
+
+
+def close_sockets(sockets: Sequence[zmq.Socket | zmq.asyncio.Socket]):
+    for sock in sockets:
+        if sock is not None:
+            sock.close(linger=0)
+
+
+def cleanup_resources(
+    processes: list[BaseProcess] | BaseProcess | None = None,
+    sockets: list[zmq.Socket] | None = None,
+):
+    if processes:
+        shutdown(processes)
+    # ZMQ context termination can hang if the sockets
+    # aren't explicitly closed first.
+    if sockets:
+        close_sockets(sockets)

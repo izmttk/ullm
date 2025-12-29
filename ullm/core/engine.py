@@ -4,7 +4,13 @@ from typing import Callable
 
 from ..config import EngineConfig
 from ..logger import init_logger
-from .common import EngineOutput, FinishReason, ForwardBatch, SamplingParams, Sequence
+from .common import (
+    EngineStepResult,
+    FinishReason,
+    ForwardBatch,
+    SamplingParams,
+    Sequence,
+)
 from .executor import Executor
 from .scheduler import Scheduler
 
@@ -67,7 +73,7 @@ class Engine:
             self.scheduler.finish_sequence(seq)
         logger.info(f"Aborted sequence {sequence_id}.")
 
-    def step(self) -> list[EngineOutput]:
+    def step(self) -> list[EngineStepResult]:
         """
         Performs one step of inference.
 
@@ -87,9 +93,9 @@ class Engine:
         outputs = self.update_from_output(batch, output_ids)
         return outputs
 
-    def step_with_pp(self) -> list[EngineOutput]:
+    def step_with_pp(self) -> list[EngineStepResult]:
         assert self.pp_queue is not None
-        outputs: list[EngineOutput] = []
+        outputs: list[EngineStepResult] = []
         batch = None
         if not self.pp_queue.full():
             batch = self.scheduler.schedule()
@@ -108,7 +114,7 @@ class Engine:
         """
         Update sequences based on the model output.
         """
-        outputs: list[EngineOutput] = []
+        outputs: list[EngineStepResult] = []
         # Update sequences with the model output
         for seq, new_token_id in zip(batch.seqs, output_ids):
             self.scheduler.update_sequence(seq, new_token_id)
@@ -118,7 +124,7 @@ class Engine:
                 self.scheduler.finish_sequence(seq)
 
             outputs.append(
-                EngineOutput(
+                EngineStepResult(
                     seq_id=seq.seq_id,
                     new_token_id=new_token_id,
                     is_finished=is_finished,

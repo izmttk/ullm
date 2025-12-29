@@ -8,12 +8,15 @@ import weakref
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 
+import msgspec
 import torch.multiprocessing as mp
+import zmq
 
 from ..config import EngineConfig
 from ..logger import init_logger
-from ..utils import shutdown
-from .common import EngineDeadError, EngineOutput, SamplingParams
+from ..serial import MsgpackDecoder, MsgpackEncoder
+from ..utils import cleanup_resources
+from .common import EngineDeadError, EngineStepResult, SamplingParams
 from .engine import Engine
 
 logger = init_logger(__name__)
@@ -32,11 +35,55 @@ class EngineEvent:
     type: EngineEventType
 
 
+class EngineRequestBase(
+    msgspec.Struct,
+    array_like=True,
+    omit_defaults=True,
+    gc=False,
+    tag=True,
+):
+    sequence_id: str
+
+
+class EngineRequestAdd(EngineRequestBase):
+    prompt_token_ids: list[int]
+    sampling_params: SamplingParams
+
+
+class EngineRequestAbort(EngineRequestBase):
+    pass
+
+
+EngineRequest = EngineRequestAdd | EngineRequestAbort
+
+
+class EngineOutputs(
+    msgspec.Struct,
+    array_like=True,
+    omit_defaults=True,
+    gc=False,
+):
+    outputs: list[EngineStepResult]
+
+
+def handle_engine_request(engine: Engine, req: EngineRequestBase):
+    if isinstance(req, EngineRequestAdd):
+        engine.add_sequence(
+            sequence_id=req.sequence_id,
+            prompt_token_ids=req.prompt_token_ids,
+            sampling_params=req.sampling_params,
+        )
+    elif isinstance(req, EngineRequestAbort):
+        engine.abort_sequence(sequence_id=req.sequence_id)
+    else:
+        raise ValueError(f"Invalid request: {type(req).__name__}")
+
+
 def run_engine_loop(
     config: EngineConfig,
     report_pipe: Connection,
-    input_queue: mp.Queue,
-    output_queue: mp.Queue,
+    input_path: str,
+    output_path: str,
 ):
     report_pipe.send(EngineEvent(EngineEventType.STARTUP))
     logging.basicConfig(level=config.log_level.upper())
@@ -54,6 +101,35 @@ def run_engine_loop(
     heartbeat_thread: threading.Thread | None = None
     engine_failed = False
     try:
+        ctx = zmq.Context()
+
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder(EngineRequest)
+
+        input_queue: queue.Queue[EngineRequest] = queue.Queue()
+        output_queue: queue.Queue[EngineOutputs] = queue.Queue()
+
+        def process_input_sockets():
+            input_socket = ctx.socket(zmq.PULL)
+            input_socket.connect(input_path)
+            while True:
+                frames = input_socket.recv_multipart(copy=False)
+                msg = decoder.decode(frames)
+                assert isinstance(msg, EngineRequest)
+                input_queue.put_nowait(msg)
+
+        def process_output_sockets():
+            output_socket = ctx.socket(zmq.PUSH)
+            output_socket.connect(output_path)
+            while True:
+                outputs = output_queue.get()
+                frames = encoder.encode(outputs)
+                output_socket.send_multipart(frames, copy=False)
+
+        input_thread = threading.Thread(target=process_input_sockets, daemon=True)
+        output_thread = threading.Thread(target=process_output_sockets, daemon=True)
+        input_thread.start()
+        output_thread.start()
 
         def failure_callback():
             nonlocal engine_failed
@@ -79,29 +155,19 @@ def run_engine_loop(
             # 则在调用下一次 step 之前，阻塞等待一个新的请求
             if not engine.has_unfinished_sequences():
                 try:
-                    method_name, args, kwargs = input_queue.get(timeout=0.1)
+                    req = input_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                method = getattr(engine, method_name, None) if method_name else None
-                method = method if callable(method) else None
-                if method:
-                    method(*args, **kwargs)
-                else:
-                    raise ValueError(f"Unknown method: {method_name}")
+                handle_engine_request(engine, req)
 
             # 其他情况下，即存在未完成的请求，则需要继续调用 step
             while not input_queue.empty():
-                method_name, args, kwargs = input_queue.get_nowait()
-                method = getattr(engine, method_name, None) if method_name else None
-                method = method if callable(method) else None
-                if method:
-                    method(*args, **kwargs)
-                else:
-                    raise ValueError(f"Unknown method: {method_name}")
+                req = input_queue.get_nowait()
+                handle_engine_request(engine, req)
 
             outputs = engine.step()
             if outputs:
-                output_queue.put_nowait(outputs)
+                output_queue.put_nowait(EngineOutputs(outputs=outputs))
     except SystemExit:
         shutdown_requested = True
         logger.debug("Engine process exit.")
@@ -137,8 +203,20 @@ class MpClient:
 
         self.config = config
         self.mp_ctx = mp.get_context("spawn")
-        self.input_queue = self.mp_ctx.Queue()
-        self.output_queue = self.mp_ctx.Queue()
+
+        self.zmq_ctx = zmq.Context()
+        self.input_socket = self.zmq_ctx.socket(zmq.PUSH)
+        self.output_socket = self.zmq_ctx.socket(zmq.PULL)
+
+        self.input_path = "ipc:///tmp/ullm_engine_input"
+        self.output_path = "ipc:///tmp/ullm_engine_output"
+
+        self.input_socket.bind(self.input_path)
+        self.output_socket.bind(self.output_path)
+
+        self.encoder = MsgpackEncoder()
+        self.decoder = MsgpackDecoder(EngineOutputs)
+
         self.is_dead = False
 
         self.start_engine()
@@ -160,12 +238,17 @@ class MpClient:
             args=(
                 self.config,
                 report_writer,
-                self.input_queue,
-                self.output_queue,
+                self.input_path,
+                self.output_path,
             ),
         )
         self.engine_process.start()
-        self._finalizer = weakref.finalize(self, shutdown, self.engine_process)
+        self._finalizer = weakref.finalize(
+            self,
+            cleanup_resources,
+            processes=[self.engine_process],
+            sockets=[self.input_socket, self.output_socket],
+        )
 
         logger.debug("Engine process started.")
 
@@ -217,24 +300,39 @@ class EngineClient(MpClient):
     ):
         if self.is_dead:
             raise EngineDeadError()
-        self.input_queue.put_nowait(
-            ("add_sequence", (sequence_id, prompt_token_ids, sampling_params), {})
+        frames = self.encoder.encode(
+            EngineRequestAdd(
+                sequence_id=sequence_id,
+                prompt_token_ids=prompt_token_ids,
+                sampling_params=sampling_params,
+            )
+        )
+
+        self.input_socket.send_multipart(
+            frames,
+            copy=False,
         )
 
     def abort_sequence(self, sequence_id: str):
         if self.is_dead:
             raise EngineDeadError()
-        self.input_queue.put_nowait(("abort_sequence", (sequence_id,), {}))
+        frames = self.encoder.encode(EngineRequestAbort(sequence_id=sequence_id))
+        self.input_socket.send_multipart(frames, copy=False)
 
-    def get_output(self) -> list[EngineOutput]:
+    def get_output(self) -> list[EngineStepResult]:
+        self.output_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
         while True:
             # raise an exception if engine process has died
             # this will help server to shutdown automatically
             if self.is_dead:
                 raise EngineDeadError()
             try:
-                outputs = self.output_queue.get(timeout=1.0)
+                frames = self.output_socket.recv_multipart(
+                    flags=zmq.NOBLOCK, copy=False
+                )
+                outputs = self.decoder.decode(frames)
+                assert isinstance(outputs, EngineOutputs)
                 break
-            except queue.Empty:
+            except zmq.Again:
                 continue
-        return outputs
+        return outputs.outputs

@@ -2,6 +2,7 @@ import enum
 import logging
 import multiprocessing as mp
 import os
+import pickle
 import queue
 import signal
 import threading
@@ -15,10 +16,12 @@ from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
 from typing import Callable
 
+import zmq
+
 from ..config import EngineConfig
 from ..core.worker import Worker
 from ..logger import init_logger
-from ..utils import shutdown
+from ..utils import cleanup_resources
 from .common import ForwardBatch
 
 logger = init_logger(__name__)
@@ -43,6 +46,22 @@ class WorkerEvent:
     type: WorkerEventType
 
 
+def handle_rpc_request(worker: Worker, method_name: str, *args, **kwargs):
+    # 查找并调用注册的方法
+    method = getattr(worker, method_name, None) if method_name else None
+    method = method if callable(method) else None
+    try:
+        if method:
+            result = method(*args, **kwargs)
+            return ResponseStatus.SUCCESS, result
+        else:
+            # 方法不存在
+            raise ValueError(f"Unknown method: {method_name}")
+    except Exception as e:
+        e.add_note(traceback.format_exc())
+        return ResponseStatus.FAILED, e
+
+
 def run_worker_loop(
     config: EngineConfig,
     rank: int,
@@ -50,8 +69,8 @@ def run_worker_loop(
     pp_rank: int,
     is_driver_worker: bool,
     report_pipe: Connection,
-    input_queue: mp.Queue,
-    output_queue: mp.Queue,
+    broadcast_path: str,
+    response_path: str,
 ):
     report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.STARTUP))
 
@@ -70,6 +89,38 @@ def run_worker_loop(
     worker: Worker | None = None
     heartbeat_thread: threading.Thread | None = None
     try:
+        ctx = zmq.Context()
+
+        input_queue = queue.Queue()
+        output_queue: queue.Queue | None = None
+
+        def process_input_socket():
+            input_socket = ctx.socket(zmq.SUB)
+            # Subscribe to all messages, if not set, all messages will be dropped
+            input_socket.setsockopt(zmq.SUBSCRIBE, b"")
+            input_socket.connect(broadcast_path)
+            while True:
+                frames = input_socket.recv_multipart(copy=False)
+                msg = pickle.loads(frames[0].bytes)
+                input_queue.put_nowait(msg)
+
+        input_thread = threading.Thread(target=process_input_socket, daemon=True)
+        input_thread.start()
+
+        if is_driver_worker:
+            output_queue = queue.Queue()
+
+            def process_output_socket():
+                output_socket = ctx.socket(zmq.PUSH)
+                output_socket.connect(response_path)
+                while True:
+                    outputs = output_queue.get()
+                    frames = [pickle.dumps(outputs)]
+                    output_socket.send_multipart(frames, copy=False)
+
+            output_thread = threading.Thread(target=process_output_socket, daemon=True)
+            output_thread.start()
+
         worker = Worker(config=config, rank=rank, tp_rank=tp_rank, pp_rank=pp_rank)
         worker.init_environment()
 
@@ -93,7 +144,7 @@ def run_worker_loop(
             status, resp = handle_rpc_request(
                 worker, method_name, *args, **kwargs
             )  # 处理请求
-            if is_driver_worker:
+            if output_queue is not None:
                 output_queue.put_nowait((request_id, status, resp))
     except SystemExit:
         shutdown_requested = True
@@ -123,29 +174,12 @@ def run_worker_loop(
             worker.destroy_environment()
 
 
-def handle_rpc_request(worker: Worker, method_name: str, *args, **kwargs):
-    # 查找并调用注册的方法
-    method = getattr(worker, method_name, None) if method_name else None
-    method = method if callable(method) else None
-    try:
-        if method:
-            result = method(*args, **kwargs)
-            return ResponseStatus.SUCCESS, result
-        else:
-            # 方法不存在
-            raise ValueError(f"Unknown method: {method_name}")
-    except Exception as e:
-        e.add_note(traceback.format_exc())
-        return ResponseStatus.FAILED, e
-
-
 @dataclass
 class WorkerProc:
     proc: BaseProcess
     rank: int
+    is_driver_worker: bool
     report_pipe: Connection
-    input_queue: mp.Queue
-    output_queue: mp.Queue
 
     @staticmethod
     def create(
@@ -154,12 +188,12 @@ class WorkerProc:
         tp_rank: int,
         pp_rank: int,
         is_driver_worker: bool,
+        broadcast_path: str,
+        response_path: str,
     ) -> "WorkerProc":
         mp_ctx = mp.get_context("spawn")
-        input_queue = mp_ctx.Queue()
-        output_queue = mp_ctx.Queue()
-        report_reader, report_writer = mp.Pipe(duplex=False)
 
+        report_reader, report_writer = mp.Pipe(duplex=False)
         proc = mp_ctx.Process(
             target=run_worker_loop,
             name=f"worker-{rank}",
@@ -170,8 +204,8 @@ class WorkerProc:
                 pp_rank,
                 is_driver_worker,
                 report_writer,
-                input_queue,
-                output_queue,
+                broadcast_path,
+                response_path,
             ),
         )
         proc.start()
@@ -179,9 +213,8 @@ class WorkerProc:
         return WorkerProc(
             proc=proc,
             rank=rank,
+            is_driver_worker=is_driver_worker,
             report_pipe=report_reader,
-            input_queue=input_queue,
-            output_queue=output_queue,
         )
 
 
@@ -194,6 +227,15 @@ class MultiWorkerClient:
         self.driver_worker: WorkerProc
 
         self.mp_ctx = mp.get_context("spawn")
+        self.zmq_ctx = zmq.Context()
+
+        self.broadcast_socket = self.zmq_ctx.socket(zmq.PUB)
+        self.broadcast_path = "ipc:///tmp/ullm_executor_broadcast"
+        self.broadcast_socket.bind(self.broadcast_path)
+
+        self.response_socket = self.zmq_ctx.socket(zmq.PULL)
+        self.response_path = "ipc:///tmp/ullm_executor_response"
+        self.response_socket.bind(self.response_path)
 
         self.callbacks: dict[WorkerEventType, list[Callable[[WorkerEvent], None]]] = {
             type: [] for type in WorkerEventType
@@ -247,22 +289,28 @@ class MultiWorkerClient:
     def start_workers(self):
         for pp_rank in range(self.pp_size):
             for tp_rank in range(self.tp_size):
+                rank = pp_rank * self.tp_size + tp_rank
                 is_driver_worker = tp_rank == 0 and pp_rank == self.pp_size - 1
                 logger.debug(
                     f"Starting worker process for TP rank {tp_rank}, PP rank {pp_rank} (driver: {is_driver_worker})..."
                 )
                 worker = WorkerProc.create(
                     config=self.config,
-                    rank=pp_rank * self.tp_size + tp_rank,
+                    rank=rank,
                     tp_rank=tp_rank,
                     pp_rank=pp_rank,
                     is_driver_worker=is_driver_worker,
+                    broadcast_path=self.broadcast_path,
+                    response_path=self.response_path,
                 )
                 if is_driver_worker:
                     self.driver_worker = worker
                 self.workers.append(worker)
         self._finalizer = weakref.finalize(
-            self, shutdown, [w.proc for w in self.workers]
+            self,
+            cleanup_resources,
+            processes=[w.proc for w in self.workers],
+            sockets=[self.broadcast_socket, self.response_socket],
         )
 
     def wait_worker_ready(self):
@@ -369,10 +417,14 @@ class Executor(MultiWorkerClient):
         self.collect_thread.start()
 
     def _collect_loop(self):
+        self.response_socket.setsockopt(zmq.RCVTIMEO, 1000)
         while not self.is_dead:
             try:
-                msg = self.driver_worker.output_queue.get(timeout=0.1)
-            except queue.Empty:
+                frames = self.response_socket.recv_multipart(
+                    flags=zmq.NOBLOCK, copy=False
+                )
+                msg = pickle.loads(frames[0].bytes)
+            except zmq.Again:
                 continue
             request_id, status, resp = msg
             future = self.pending.pop(request_id, None)
@@ -387,8 +439,8 @@ class Executor(MultiWorkerClient):
             raise RuntimeError("Executor has died.")
         future = Future()
         request_id = uuid.uuid4().hex
-        for worker in self.workers:
-            worker.input_queue.put_nowait((request_id, method, args, kwargs))
+        frames = [pickle.dumps((request_id, method, args, kwargs))]
+        self.broadcast_socket.send_multipart(frames, copy=False)
         self.pending[request_id] = future
         return future
 

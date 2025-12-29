@@ -32,7 +32,7 @@ class GenerateOutput:
 
 
 @dataclass
-class EngineOutput:
+class EngineStepResult:
     seq_id: str
     new_token_id: int
     is_finished: bool
