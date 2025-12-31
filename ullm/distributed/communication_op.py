@@ -6,7 +6,6 @@ import torch.distributed as dist
 from .parallel_state import Group, get_tp_group, get_world_group
 
 
-@torch.compiler.disable
 def all_gather(
     input: torch.Tensor, dim: int = -1, group: Optional[Group] = None
 ) -> torch.Tensor:
@@ -37,7 +36,6 @@ def all_gather(
     return output_tensor
 
 
-@torch.compiler.disable
 def all_reduce(
     input: torch.Tensor, op=dist.ReduceOp.SUM, group: Optional[Group] = None
 ) -> torch.Tensor:
@@ -50,7 +48,6 @@ def all_reduce(
     return input
 
 
-@torch.compiler.disable
 def reduce_scatter(
     input: torch.Tensor,
     dim: int = -1,
@@ -91,7 +88,6 @@ def reduce_scatter(
     return output_tensor.movedim(0, dim).contiguous()
 
 
-@torch.compiler.disable
 def gather(
     input: torch.Tensor, dst: int = 0, dim: int = -1, group: Optional[Group] = None
 ):
@@ -127,7 +123,6 @@ def gather(
     return output_tensor
 
 
-@torch.compiler.disable
 def broadcast(input: torch.Tensor, src: int = 0, group: Optional[Group] = None):
     """Broadcast the input tensor.
     NOTE: `src` is the local rank of the source rank.
@@ -181,7 +176,6 @@ def tensor_model_parallel_gather(
     return gather(input, dst=dst, dim=dim, group=tp_group)
 
 
-@torch.compiler.disable
 def broadcast_tensor_dict(
     tensor_dict: dict[Any, torch.Tensor] | None = None,
     src: int = 0,
@@ -244,7 +238,6 @@ def broadcast_tensor_dict(
     return result
 
 
-@torch.compiler.disable
 def send_tensor_dict(
     tensor_dict: dict[str, Union[torch.Tensor, Any]],
     dst: Optional[int] = None,
@@ -296,7 +289,6 @@ def send_tensor_dict(
             dist.send(tensor, group_dst=dst, group=group.device_group)
 
 
-@torch.compiler.disable
 def recv_tensor_dict(
     src: Optional[int] = None,
     group: Optional[Group] = None,
