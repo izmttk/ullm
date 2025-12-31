@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import lru_cache
+import inspect
 import pickle
 from collections.abc import Sequence
-from inspect import isclass
 from types import FunctionType
-from typing import Any, TypeAlias, cast
+from typing import Any, Callable, TypeAlias, cast
 
 import cloudpickle
+import msgspec
 import numpy as np
 import torch
 import zmq
@@ -16,6 +18,8 @@ from msgspec import msgpack
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_RAW_VIEW = 3
+CUSTOM_TYPE_NUMPY_ARRAY = 4
+CUSTOM_TYPE_TORCH_TENSOR = 5
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 
@@ -63,18 +67,10 @@ class MsgpackEncoder:
 
     def enc_hook(self, obj: Any) -> Any:
         if isinstance(obj, torch.Tensor):
-            return self._encode_tensor(obj)
-
+            return msgpack.Ext(CUSTOM_TYPE_TORCH_TENSOR, self._dump_tensor(obj))
         # Fall back to pickle for object or void kind ndarrays.
         if isinstance(obj, np.ndarray) and obj.dtype.kind not in ("O", "V"):
-            return self._encode_ndarray(obj)
-
-        if isinstance(obj, slice):
-            # We are assuming only int-based values will be used here.
-            return tuple(
-                int(v) if v is not None else None
-                for v in (obj.start, obj.stop, obj.step)
-            )
+            return msgpack.Ext(CUSTOM_TYPE_NUMPY_ARRAY, self._dump_ndarray(obj))
 
         if isinstance(obj, FunctionType):
             # `pickle` is generally faster than cloudpickle, but can have
@@ -85,9 +81,7 @@ class MsgpackEncoder:
             CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
         )
 
-    def _encode_ndarray(
-        self, obj: np.ndarray
-    ) -> tuple[str, tuple[int, ...], int | memoryview]:
+    def _dump_ndarray(self, obj: np.ndarray):
         assert self.aux_buffers is not None
         # If the array is non-contiguous, we need to copy it first
         arr_data = obj.data if obj.flags.c_contiguous else obj.tobytes()
@@ -103,11 +97,21 @@ class MsgpackEncoder:
         # We serialize the ndarray as a tuple of native types.
         # The data is either inlined if small, or an index into a list of
         # backing buffers that we've stashed in `aux_buffers`.
-        return obj.dtype.str, obj.shape, data
+        dtype = self.encoder.encode(obj.dtype.str)
+        shape = self.encoder.encode(obj.shape)
+        data = self.encoder.encode(data)
+        return b"".join(
+            [
+                len(dtype).to_bytes(4, "little"),
+                dtype,
+                len(shape).to_bytes(4, "little"),
+                shape,
+                len(data).to_bytes(4, "little"),
+                data,
+            ]
+        )
 
-    def _encode_tensor(
-        self, obj: torch.Tensor
-    ) -> tuple[str, tuple[int, ...], int | memoryview]:
+    def _dump_tensor(self, obj: torch.Tensor):
         assert self.aux_buffers is not None
         # view the tensor as a contiguous 1D array of bytes
         arr = obj.flatten().contiguous().view(torch.uint8).numpy()
@@ -118,8 +122,19 @@ class MsgpackEncoder:
             # Otherwise encode index of backing buffer to avoid copy.
             data = len(self.aux_buffers)
             self.aux_buffers.append(arr.data)
-        dtype = str(obj.dtype).removeprefix("torch.")
-        return dtype, obj.shape, data
+        dtype = self.encoder.encode(str(obj.dtype).removeprefix("torch."))
+        shape = self.encoder.encode(obj.shape)
+        data = self.encoder.encode(data)
+        return b"".join(
+            [
+                len(dtype).to_bytes(4, "little"),
+                dtype,
+                len(shape).to_bytes(4, "little"),
+                shape,
+                len(data).to_bytes(4, "little"),
+                data,
+            ]
+        )
 
 
 class MsgpackDecoder:
@@ -131,41 +146,44 @@ class MsgpackDecoder:
 
     def __init__(self, t: Any | None = None):
         args = () if t is None else (t,)
-        self.decoder = msgpack.Decoder(
-            *args, ext_hook=self.ext_hook, dec_hook=self.dec_hook
-        )
+        self.decoder = msgpack.Decoder(*args, ext_hook=self.ext_hook)
         self.aux_buffers: Sequence[bytestr] = ()
 
     def decode(self, bufs: bytestr | Sequence[bytestr]) -> Any:
-        if isinstance(bufs, bytestr):  # type: ignore
-            return self.decoder.decode(bufs)
+        if isinstance(bufs, bytestr):
+            return self.decoder.decode(bufs)  # type: ignore
 
         self.aux_buffers = bufs
         try:
-            return self.decoder.decode(bufs[0])
+            return self.decoder.decode(bufs[0])  # type: ignore
         finally:
             self.aux_buffers = ()
 
-    def dec_hook(self, t: type, obj: Any) -> Any:
-        # Given native types in `obj`, convert to type `t`.
-        if isclass(t):
-            if issubclass(t, np.ndarray):
-                return self._decode_ndarray(obj)
-            if issubclass(t, torch.Tensor):
-                return self._decode_tensor(obj)
-            if t is slice:
-                return slice(*obj)
-        return obj
+    def _load_ndarray(self, arr: bytes) -> np.ndarray:
+        dtype_size = int.from_bytes(arr[0:4], "little")
+        dtype = self.decoder.decode(arr[4 : 4 + dtype_size])
+        shape_start = 4 + dtype_size
+        shape_size = int.from_bytes(arr[shape_start : shape_start + 4], "little")
+        shape = self.decoder.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
+        data_start = shape_start + 4 + shape_size
+        data_size = int.from_bytes(arr[data_start : data_start + 4], "little")
+        data = self.decoder.decode(arr[data_start + 4 : data_start + 4 + data_size])
 
-    def _decode_ndarray(self, arr: Any) -> np.ndarray:
-        dtype, shape, data = arr
         # zero-copy decode. We assume the ndarray will not be kept around,
         # as it now locks the whole received message buffer in memory.
         buffer = self.aux_buffers[data] if isinstance(data, int) else data
         return np.frombuffer(buffer, dtype=dtype).reshape(shape)
 
-    def _decode_tensor(self, arr: Any) -> torch.Tensor:
-        dtype, shape, data = arr
+    def _load_tensor(self, arr: Any) -> torch.Tensor:
+        dtype_size = int.from_bytes(arr[0:4], "little")
+        dtype = self.decoder.decode(arr[4 : 4 + dtype_size])
+        shape_start = 4 + dtype_size
+        shape_size = int.from_bytes(arr[shape_start : shape_start + 4], "little")
+        shape = self.decoder.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
+        data_start = shape_start + 4 + shape_size
+        data_size = int.from_bytes(arr[data_start : data_start + 4], "little")
+        data = self.decoder.decode(arr[data_start + 4 : data_start + 4 + data_size])
+
         # Copy from inline representation, to decouple the memory storage
         # of the message from the original buffer. And also make Torch
         # not complain about a readonly memoryview.
@@ -183,6 +201,10 @@ class MsgpackDecoder:
     def ext_hook(self, code: int, data: memoryview) -> Any:
         if code == CUSTOM_TYPE_RAW_VIEW:
             return data
+        if code == CUSTOM_TYPE_NUMPY_ARRAY:
+            return self._load_ndarray(data)
+        if code == CUSTOM_TYPE_TORCH_TENSOR:
+            return self._load_tensor(data)
 
         if code == CUSTOM_TYPE_PICKLE:
             return pickle.loads(data)

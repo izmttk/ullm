@@ -2,7 +2,6 @@ import enum
 import logging
 import multiprocessing as mp
 import os
-import pickle
 import queue
 import signal
 import threading
@@ -16,7 +15,10 @@ from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
 from typing import Callable
 
+import msgspec
 import zmq
+
+from ullm.serial import MsgpackDecoder, MsgpackEncoder
 
 from ..config import EngineConfig
 from ..core.worker import Worker
@@ -25,11 +27,6 @@ from ..utils import cleanup_resources
 from .common import ForwardBatch
 
 logger = init_logger(__name__)
-
-
-class ResponseStatus(enum.Enum):
-    SUCCESS = enum.auto()
-    FAILED = enum.auto()
 
 
 class WorkerEventType(enum.Enum):
@@ -46,20 +43,101 @@ class WorkerEvent:
     type: WorkerEventType
 
 
-def handle_rpc_request(worker: Worker, method_name: str, *args, **kwargs):
-    # 查找并调用注册的方法
-    method = getattr(worker, method_name, None) if method_name else None
-    method = method if callable(method) else None
+class RpcRequestBase(
+    msgspec.Struct,
+    array_like=True,
+    omit_defaults=True,
+    gc=False,
+    tag=True,
+    kw_only=True,
+):
+    request_id: str = msgspec.field(default_factory=lambda: uuid.uuid4().hex)
+    method_name: str
+
+
+class RpcRequestExecuteModel(RpcRequestBase, kw_only=True):
+    method_name: str = "execute_model"
+    batch: ForwardBatch
+
+
+class RpcRequestInitialize(RpcRequestBase, kw_only=True):
+    method_name: str = "initialize"
+    gpu_memory_utilization: float
+
+
+class RpcRequestGetKVCacheSize(RpcRequestBase, kw_only=True):
+    method_name: str = "get_kv_cache_size"
+
+
+RpcRequest = RpcRequestExecuteModel | RpcRequestInitialize | RpcRequestGetKVCacheSize
+
+
+class RpcResponseBase(
+    msgspec.Struct,
+    array_like=True,
+    omit_defaults=True,
+    gc=False,
+    tag=True,
+):
+    request_id: str
+
+
+class RpcResponseException(RpcResponseBase):
+    err_type: str
+    message: str
+    traceback: str
+
+
+class RpcResponseNone(RpcResponseBase):
+    result: None = None
+
+
+class RpcResponseExecuteModel(RpcResponseBase):
+    result: list[int] | None = None
+
+
+class RpcResponseGetKVCacheSize(RpcResponseBase):
+    result: int
+
+
+RpcResponse = (
+    RpcResponseExecuteModel
+    | RpcResponseGetKVCacheSize
+    | RpcResponseNone
+    | RpcResponseException
+)
+
+
+def handle_rpc_request(worker: Worker, req: RpcRequest):
     try:
-        if method:
-            result = method(*args, **kwargs)
-            return ResponseStatus.SUCCESS, result
+        if isinstance(req, RpcRequestExecuteModel):
+            result = worker.execute_model(req.batch)
+            return RpcResponseExecuteModel(
+                request_id=req.request_id,
+                result=result,
+            )
+        elif isinstance(req, RpcRequestInitialize):
+            result = worker.initialize(req.gpu_memory_utilization)
+            return RpcResponseNone(
+                request_id=req.request_id,
+                result=result,
+            )
+        elif isinstance(req, RpcRequestGetKVCacheSize):
+            result = worker.get_kv_cache_size()
+            return RpcResponseGetKVCacheSize(
+                request_id=req.request_id,
+                result=result,
+            )
         else:
-            # 方法不存在
-            raise ValueError(f"Unknown method: {method_name}")
+            raise ValueError(f"Unknown method: {req.method_name}")
     except Exception as e:
         e.add_note(traceback.format_exc())
-        return ResponseStatus.FAILED, e
+        return RpcResponseException(
+            request_id=req.request_id,
+            err_type=type(e).__name__,
+            message=str(e),
+            traceback=traceback.format_exc(),
+        )
 
 
 def run_worker_loop(
@@ -91,8 +169,11 @@ def run_worker_loop(
     try:
         ctx = zmq.Context()
 
-        input_queue = queue.Queue()
-        output_queue: queue.Queue | None = None
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder(RpcRequest)
+
+        input_queue: queue.Queue[RpcRequest] = queue.Queue()
+        output_queue: queue.Queue[RpcResponse] | None = None
 
         def process_input_socket():
             input_socket = ctx.socket(zmq.SUB)
@@ -101,7 +182,7 @@ def run_worker_loop(
             input_socket.connect(broadcast_path)
             while True:
                 frames = input_socket.recv_multipart(copy=False)
-                msg = pickle.loads(frames[0].bytes)
+                msg = decoder.decode(frames)
                 input_queue.put_nowait(msg)
 
         input_thread = threading.Thread(target=process_input_socket, daemon=True)
@@ -115,7 +196,7 @@ def run_worker_loop(
                 output_socket.connect(response_path)
                 while True:
                     outputs = output_queue.get()
-                    frames = [pickle.dumps(outputs)]
+                    frames = encoder.encode(outputs)
                     output_socket.send_multipart(frames, copy=False)
 
             output_thread = threading.Thread(target=process_output_socket, daemon=True)
@@ -137,15 +218,12 @@ def run_worker_loop(
 
         while True:
             try:
-                msg = input_queue.get(timeout=0.1)  # 等待输入
+                req = input_queue.get(timeout=0.1)  # 等待输入
             except queue.Empty:
                 continue
-            request_id, method_name, args, kwargs = msg
-            status, resp = handle_rpc_request(
-                worker, method_name, *args, **kwargs
-            )  # 处理请求
+            resp = handle_rpc_request(worker, req)  # 处理请求
             if output_queue is not None:
-                output_queue.put_nowait((request_id, status, resp))
+                output_queue.put_nowait(resp)  # 发送响应
     except SystemExit:
         shutdown_requested = True
         logger.debug(f"Worker {rank} process exit.")
@@ -410,11 +488,12 @@ class MultiWorkerClient:
 class Executor(MultiWorkerClient):
     def __init__(self, config: EngineConfig):
         super().__init__(config)
-        self.pending: dict[
-            str, Future[list[int]]
-        ] = {}  # 跟踪进行中的请求 {request_id: future}
+        self.pending: dict[str, Future] = {}  # 跟踪进行中的请求 {request_id: future}
         self.collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
         self.collect_thread.start()
+
+        self.encoder = MsgpackEncoder()
+        self.decoder = MsgpackDecoder(RpcResponse)
 
     def _collect_loop(self):
         self.response_socket.setsockopt(zmq.RCVTIMEO, 1000)
@@ -423,32 +502,38 @@ class Executor(MultiWorkerClient):
                 frames = self.response_socket.recv_multipart(
                     flags=zmq.NOBLOCK, copy=False
                 )
-                msg = pickle.loads(frames[0].bytes)
+                msg = self.decoder.decode(frames)
             except zmq.Again:
                 continue
-            request_id, status, resp = msg
-            future = self.pending.pop(request_id, None)
+            assert isinstance(msg, RpcResponse)
+            future = self.pending.pop(msg.request_id, None)
             if future:
-                if status == ResponseStatus.SUCCESS:
-                    future.set_result(resp)
-                elif status == ResponseStatus.FAILED:
-                    future.set_exception(resp)
+                if isinstance(msg, RpcResponseException):
+                    future.set_exception(
+                        RuntimeError(f"{msg.err_type}: {msg.message}\n{msg.traceback}")
+                    )
+                else:
+                    future.set_result(msg.result)
 
-    def submit(self, method, *args, **kwargs):
+    def submit(self, req: RpcRequest):
         if self.is_dead:
             raise RuntimeError("Executor has died.")
         future = Future()
-        request_id = uuid.uuid4().hex
-        frames = [pickle.dumps((request_id, method, args, kwargs))]
+        request_id = req.request_id
+        frames = self.encoder.encode(req)
         self.broadcast_socket.send_multipart(frames, copy=False)
         self.pending[request_id] = future
         return future
 
     def execute_model(self, batch: ForwardBatch) -> Future[list[int]]:
-        return self.submit("execute_model", batch)
+        return self.submit(RpcRequestExecuteModel(batch=batch))
 
     def initialize(self):
-        self.submit("initialize", self.config.gpu_memory_utilization).result()
+        self.submit(
+            RpcRequestInitialize(
+                gpu_memory_utilization=self.config.gpu_memory_utilization
+            )
+        ).result()
 
     def get_kv_cache_size(self) -> int:
-        return self.submit("get_kv_cache_size").result()
+        return self.submit(RpcRequestGetKVCacheSize()).result()
