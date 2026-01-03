@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import torch
 
 from ..config import EngineConfig
@@ -39,6 +42,26 @@ class Worker:
         self.context_len = config.context_len
 
         self.world_size = self.tp_size * self.pp_size
+
+        if config.profile:
+            profile_dir = Path(config.profile_dir)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            profile_dir = str(profile_dir.resolve())
+            self.profile_dir = profile_dir
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    profile_dir,
+                    worker_name=f"ullm_worker_{self.rank}_TP_{self.tp_rank}_PP_{self.pp_rank}_{os.getpid()}",
+                    use_gzip=True,
+                ),
+                record_shapes=True,
+                with_stack=True,
+            )
+            self.profiler_started = False
 
     def init_environment(self):
         init_distributed_environment(
@@ -87,6 +110,9 @@ class Worker:
     def execute_model(self, batch: ForwardBatch) -> list[int] | None:
         intermediate_tensors = None
 
+        if hasattr(self, "profiler") and getattr(self, "_profiler_active", False):
+            self.profiler.step()
+
         if not get_pp_group().is_first_rank:
             recv = recv_tensor_dict(
                 group=get_pp_group(), all_gather_group=get_tp_group()
@@ -109,3 +135,28 @@ class Worker:
             "Initialize Worker before calling this function."
         )
         return self.model_runner.kv_cache_size
+
+    def profile(self, action: str):
+        if hasattr(self, "profiler"):
+            if action == "start":
+                if self.profiler_started:
+                    logger.warning(
+                        f"Profiler already started on Worker {self.rank}, ignoring."
+                    )
+                else:
+                    self.profiler.start()
+                    self.profiler_started = True
+                    logger.debug(f"Profiler started on Worker {self.rank}.")
+            elif action == "stop":
+                if not self.profiler_started:
+                    logger.warning(
+                        f"Profiler already stopped on Worker {self.rank}, ignoring."
+                    )
+                else:
+                    self.profiler.stop()
+                    self.profiler_started = False
+                    logger.debug(f"Profiler stopped on Worker {self.rank}.")
+            else:
+                logger.warning(f"Unknown profiling action: {action}, ignoring.")
+        else:
+            logger.warning(f"Profiler not enabled on Worker {self.rank}.")

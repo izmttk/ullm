@@ -1,6 +1,10 @@
+import os
 import queue
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Callable
+
+import torch
 
 from ..config import EngineConfig
 from ..logger import init_logger
@@ -41,6 +45,24 @@ class Engine:
         self.pp_queue: queue.Queue[tuple[Future[list[int]], ForwardBatch]] | None = None
         if self.config.pp_size > 1:
             self.pp_queue = queue.Queue(self.config.pp_size)
+
+        if config.profile:
+            profile_dir = Path(config.profile_dir)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            profile_dir = str(profile_dir.resolve())
+            self.profile_dir = profile_dir
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                ],
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    profile_dir,
+                    worker_name=f"ullm_engine_{os.getpid()}",
+                    use_gzip=True,
+                ),
+                with_stack=True,
+            )
+            self.profiler_started = False
 
     def add_sequence(
         self,
@@ -159,7 +181,39 @@ class Engine:
         return False, None
 
     def shutdown(self):
+        logger.debug(f"Shutting down {self.__class__.__name__}...")
         self.model_executor.shutdown()
+        logger.debug(f"{self.__class__.__name__} shut down.")
 
     def has_unfinished_sequences(self):
         return self.scheduler.has_unfinished_sequences()
+
+    def profile(self, action: str):
+        if hasattr(self, "profiler"):
+            if action == "start":
+                if self.profiler_started:
+                    logger.warning("Profiler already started on Engine, ignoring.")
+                else:
+                    self.profiler.start()
+                    self.profiler_started = True
+                    logger.debug("Profiler started on Engine.")
+            elif action == "stop":
+                if not self.profiler_started:
+                    logger.warning("Profiler already stopped on Engine, ignoring.")
+                else:
+                    logger.info("Stopping profiling, this may take a while...")
+                    self.profiler.stop()
+                    self.profiler_started = False
+                    logger.debug("Profiler stopped on Engine.")
+            else:
+                logger.warning(f"Unknown profiling action: {action}, ignoring.")
+        else:
+            logger.warning("Profiler not initialized on Engine, ignoring.")
+        self.model_executor.profile(action)
+        if hasattr(self, "profiler"):
+            if action == "start":
+                logger.info("Profiler successfully started.")
+            elif action == "stop":
+                logger.info(
+                    f"Profiler successfully stopped, data saved to {self.profile_dir}."
+                )

@@ -121,3 +121,6 @@ class LLM:
     async def shutdown(self):
         self.output_processor_task.cancel()
         await asyncio.to_thread(self.engine.shutdown)
+
+    async def profile(self, action: str):
+        await asyncio.to_thread(self.engine.profile, action)

@@ -23,7 +23,7 @@ from ullm.serial import MsgpackDecoder, MsgpackEncoder
 from ..config import EngineConfig
 from ..core.worker import Worker
 from ..logger import init_logger
-from ..utils import cleanup_resources
+from ..utils import close_sockets, shutdown
 from .common import ForwardBatch
 
 logger = init_logger(__name__)
@@ -69,7 +69,17 @@ class RpcRequestGetKVCacheSize(RpcRequestBase, kw_only=True):
     method_name: str = "get_kv_cache_size"
 
 
-RpcRequest = RpcRequestExecuteModel | RpcRequestInitialize | RpcRequestGetKVCacheSize
+class RpcRequestProfile(RpcRequestBase, kw_only=True):
+    method_name: str = "profile"
+    action: str  # "start" or "stop"
+
+
+RpcRequest = (
+    RpcRequestExecuteModel
+    | RpcRequestInitialize
+    | RpcRequestGetKVCacheSize
+    | RpcRequestProfile
+)
 
 
 class RpcResponseBase(
@@ -117,17 +127,17 @@ def handle_rpc_request(worker: Worker, req: RpcRequest):
                 result=result,
             )
         elif isinstance(req, RpcRequestInitialize):
-            result = worker.initialize(req.gpu_memory_utilization)
-            return RpcResponseNone(
-                request_id=req.request_id,
-                result=result,
-            )
+            worker.initialize(req.gpu_memory_utilization)
+            return RpcResponseNone(request_id=req.request_id)
         elif isinstance(req, RpcRequestGetKVCacheSize):
             result = worker.get_kv_cache_size()
             return RpcResponseGetKVCacheSize(
                 request_id=req.request_id,
                 result=result,
             )
+        elif isinstance(req, RpcRequestProfile):
+            worker.profile(req.action)
+            return RpcResponseNone(request_id=req.request_id)
         else:
             raise ValueError(f"Unknown method: {req.method_name}")
     except Exception as e:
@@ -217,17 +227,13 @@ def run_worker_loop(
         heartbeat_thread.start()
 
         while True:
-            try:
-                req = input_queue.get(timeout=0.1)  # 等待输入
-            except queue.Empty:
-                continue
+            req = input_queue.get()  # 等待输入
             resp = handle_rpc_request(worker, req)  # 处理请求
             if output_queue is not None:
                 output_queue.put_nowait(resp)  # 发送响应
     except SystemExit:
         shutdown_requested = True
-        logger.debug(f"Worker {rank} process exit.")
-        raise
+        logger.debug("Keyboard interrupt received, shutting down worker process.")
     except Exception:
         shutdown_requested = True
         if heartbeat_thread and heartbeat_thread.is_alive():
@@ -250,6 +256,7 @@ def run_worker_loop(
             pass  # 管道已关闭是正常的
         if worker:
             worker.destroy_environment()
+        logger.debug(f"Worker {rank} process exit.")
 
 
 @dataclass
@@ -307,12 +314,16 @@ class MultiWorkerClient:
         self.mp_ctx = mp.get_context("spawn")
         self.zmq_ctx = zmq.Context()
 
-        self.broadcast_socket = self.zmq_ctx.socket(zmq.PUB)
+        self.encoder = MsgpackEncoder()
+        self.decoder = MsgpackDecoder(RpcResponse)
+
         self.broadcast_path = "ipc:///tmp/ullm_executor_broadcast"
+        self.response_path = "ipc:///tmp/ullm_executor_response"
+
+        self.broadcast_socket = self.zmq_ctx.socket(zmq.PUB)
         self.broadcast_socket.bind(self.broadcast_path)
 
         self.response_socket = self.zmq_ctx.socket(zmq.PULL)
-        self.response_path = "ipc:///tmp/ullm_executor_response"
         self.response_socket.bind(self.response_path)
 
         self.callbacks: dict[WorkerEventType, list[Callable[[WorkerEvent], None]]] = {
@@ -321,6 +332,21 @@ class MultiWorkerClient:
         self.callbacks_lock = threading.Lock()
 
         self.is_dead = False
+
+        weak_self = weakref.ref(self)
+
+        def cleanup_resources():
+            self_ref = weak_self()
+            if not self_ref:
+                return
+            if hasattr(self_ref, "is_dead"):
+                self_ref.is_dead = True
+            if hasattr(self_ref, "workers"):
+                shutdown([w.proc for w in self_ref.workers])
+            if hasattr(self_ref, "broadcast_socket"):
+                close_sockets([self_ref.broadcast_socket])
+
+        self._finalizer = weakref.finalize(self, cleanup_resources)
 
         self.set_envs()
         self.start_workers()
@@ -384,12 +410,6 @@ class MultiWorkerClient:
                 if is_driver_worker:
                     self.driver_worker = worker
                 self.workers.append(worker)
-        self._finalizer = weakref.finalize(
-            self,
-            cleanup_resources,
-            processes=[w.proc for w in self.workers],
-            sockets=[self.broadcast_socket, self.response_socket],
-        )
 
     def wait_worker_ready(self):
         logger.debug("Waiting for all workers to be ready...")
@@ -446,7 +466,6 @@ class MultiWorkerClient:
                         type=WorkerEventType.DEAD,
                     )
                 )
-            self_ref.is_dead = True
             self_ref.shutdown()
 
         def worker_event_monitor():
@@ -489,31 +508,42 @@ class Executor(MultiWorkerClient):
     def __init__(self, config: EngineConfig):
         super().__init__(config)
         self.pending: dict[str, Future] = {}  # 跟踪进行中的请求 {request_id: future}
-        self.collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
-        self.collect_thread.start()
+        self.process_output_sockets_thread = threading.Thread(
+            target=self.process_output_sockets, daemon=True
+        )
+        self.process_output_sockets_thread.start()
 
-        self.encoder = MsgpackEncoder()
-        self.decoder = MsgpackDecoder(RpcResponse)
-
-    def _collect_loop(self):
-        self.response_socket.setsockopt(zmq.RCVTIMEO, 1000)
-        while not self.is_dead:
-            try:
-                frames = self.response_socket.recv_multipart(
-                    flags=zmq.NOBLOCK, copy=False
-                )
+    def process_output_sockets(self):
+        try:
+            poller = zmq.Poller()
+            poller.register(self.response_socket, zmq.POLLIN)
+            while not self.is_dead:
+                socks = dict(poller.poll(timeout=1000))
+                if self.response_socket not in socks:
+                    continue
+                frames = self.response_socket.recv_multipart(copy=False)
                 msg = self.decoder.decode(frames)
-            except zmq.Again:
-                continue
-            assert isinstance(msg, RpcResponse)
-            future = self.pending.pop(msg.request_id, None)
-            if future:
-                if isinstance(msg, RpcResponseException):
-                    future.set_exception(
-                        RuntimeError(f"{msg.err_type}: {msg.message}\n{msg.traceback}")
-                    )
-                else:
-                    future.set_result(msg.result)
+                assert isinstance(msg, RpcResponse)
+                future = self.pending.pop(msg.request_id, None)
+                if future:
+                    if isinstance(msg, RpcResponseException):
+                        future.set_exception(
+                            RuntimeError(
+                                f"{msg.err_type}: {msg.message}\n{msg.traceback}"
+                            )
+                        )
+                    else:
+                        future.set_result(msg.result)
+            # Set exceptions for all pending futures to avoid deadlocks
+            # in case executor is shut down while there are pending requests
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(RuntimeError("Executor has died."))
+        except Exception as e:
+            # Set exceptions for all pending futures to avoid deadlocks
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(e)
 
     def submit(self, req: RpcRequest):
         if self.is_dead:
@@ -537,3 +567,6 @@ class Executor(MultiWorkerClient):
 
     def get_kv_cache_size(self) -> int:
         return self.submit(RpcRequestGetKVCacheSize()).result()
+
+    def profile(self, action: str):
+        self.submit(RpcRequestProfile(action=action)).result()

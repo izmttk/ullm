@@ -15,7 +15,7 @@ import zmq
 from ..config import EngineConfig
 from ..logger import init_logger
 from ..serial import MsgpackDecoder, MsgpackEncoder
-from ..utils import cleanup_resources
+from ..utils import shutdown
 from .common import EngineDeadError, EngineStepResult, SamplingParams
 from .engine import Engine
 
@@ -42,19 +42,24 @@ class EngineRequestBase(
     gc=False,
     tag=True,
 ):
-    sequence_id: str
+    pass
 
 
 class EngineRequestAdd(EngineRequestBase):
+    sequence_id: str
     prompt_token_ids: list[int]
     sampling_params: SamplingParams
 
 
 class EngineRequestAbort(EngineRequestBase):
-    pass
+    sequence_id: str
 
 
-EngineRequest = EngineRequestAdd | EngineRequestAbort
+class EngineRequestProfile(EngineRequestBase):
+    action: str  # "start" or "stop"
+
+
+EngineRequest = EngineRequestAdd | EngineRequestAbort | EngineRequestProfile
 
 
 class EngineOutputs(
@@ -66,7 +71,7 @@ class EngineOutputs(
     outputs: list[EngineStepResult]
 
 
-def handle_engine_request(engine: Engine, req: EngineRequestBase):
+def handle_engine_request(engine: Engine, req: EngineRequest):
     if isinstance(req, EngineRequestAdd):
         engine.add_sequence(
             sequence_id=req.sequence_id,
@@ -75,6 +80,8 @@ def handle_engine_request(engine: Engine, req: EngineRequestBase):
         )
     elif isinstance(req, EngineRequestAbort):
         engine.abort_sequence(sequence_id=req.sequence_id)
+    elif isinstance(req, EngineRequestProfile):
+        engine.profile(action=req.action)
     else:
         raise ValueError(f"Invalid request: {type(req).__name__}")
 
@@ -99,14 +106,14 @@ def run_engine_loop(
 
     engine: Engine | None = None
     heartbeat_thread: threading.Thread | None = None
-    engine_failed = False
+    STOP_SENTINEL = type("STOP_SENTINEL", (), {})
     try:
         ctx = zmq.Context()
 
         encoder = MsgpackEncoder()
         decoder = MsgpackDecoder(EngineRequest)
 
-        input_queue: queue.Queue[EngineRequest] = queue.Queue()
+        input_queue: queue.Queue[EngineRequest | STOP_SENTINEL] = queue.Queue()
         output_queue: queue.Queue[EngineOutputs] = queue.Queue()
 
         def process_input_sockets():
@@ -132,8 +139,8 @@ def run_engine_loop(
         output_thread.start()
 
         def failure_callback():
-            nonlocal engine_failed
-            engine_failed = True
+            input_queue.put_nowait(STOP_SENTINEL())
+            logger.debug("Engine failure detected, stopping engine loop.")
 
         engine = Engine(config=config, failure_callback=failure_callback)
 
@@ -149,20 +156,20 @@ def run_engine_loop(
         heartbeat_thread.start()
 
         while True:
-            if engine_failed:
-                raise RuntimeError("Engine has encountered a fatal error.")
             # 如果 engine 中没有未完成的请求了，即 engine 的 waiting 和 running 队列都空了
             # 则在调用下一次 step 之前，阻塞等待一个新的请求
             if not engine.has_unfinished_sequences():
-                try:
-                    req = input_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
+                req = input_queue.get()
+                if isinstance(req, STOP_SENTINEL):
+                    raise RuntimeError("Engine has encountered a fatal error.")
+
                 handle_engine_request(engine, req)
 
             # 其他情况下，即存在未完成的请求，则需要继续调用 step
             while not input_queue.empty():
                 req = input_queue.get_nowait()
+                if isinstance(req, STOP_SENTINEL):
+                    raise RuntimeError("Engine has encountered a fatal error.")
                 handle_engine_request(engine, req)
 
             outputs = engine.step()
@@ -170,8 +177,7 @@ def run_engine_loop(
                 output_queue.put_nowait(EngineOutputs(outputs=outputs))
     except SystemExit:
         shutdown_requested = True
-        logger.debug("Engine process exit.")
-        raise
+        logger.debug("Keyboard interrupt received, shutting down engine process.")
     except Exception:
         shutdown_requested = True
         if heartbeat_thread and heartbeat_thread.is_alive():
@@ -194,7 +200,7 @@ def run_engine_loop(
             pass  # 管道已关闭是正常的
         if engine:
             engine.shutdown()
-            logger.debug("Engine has been shut down.")
+        logger.debug("Engine process exit.")
 
 
 class MpClient:
@@ -203,22 +209,36 @@ class MpClient:
 
         self.config = config
         self.mp_ctx = mp.get_context("spawn")
-
         self.zmq_ctx = zmq.Context()
-        self.input_socket = self.zmq_ctx.socket(zmq.PUSH)
-        self.output_socket = self.zmq_ctx.socket(zmq.PULL)
-
-        self.input_path = "ipc:///tmp/ullm_engine_input"
-        self.output_path = "ipc:///tmp/ullm_engine_output"
-
-        self.input_socket.bind(self.input_path)
-        self.output_socket.bind(self.output_path)
 
         self.encoder = MsgpackEncoder()
         self.decoder = MsgpackDecoder(EngineOutputs)
 
+        self.input_path = "ipc:///tmp/ullm_engine_input"
+        self.output_path = "ipc:///tmp/ullm_engine_output"
+
+        self.input_socket = self.zmq_ctx.socket(zmq.PUSH)
+        self.input_socket.bind(self.input_path)
+
+        self.output_socket = self.zmq_ctx.socket(zmq.PULL)
+        self.output_socket.bind(self.output_path)
+
         self.is_dead = False
 
+        weak_self = weakref.ref(self)
+
+        def cleanup_resources():
+            self_ref = weak_self()
+            if not self_ref:
+                return
+            if hasattr(self_ref, "is_dead"):
+                self_ref.is_dead = True
+            if hasattr(self_ref, "engine_process"):
+                shutdown(self_ref.engine_process)
+            if hasattr(self_ref, "input_socket"):
+                self_ref.input_socket.close()
+
+        self._finalizer = weakref.finalize(self, cleanup_resources)
         self.start_engine()
         self.start_engine_monitor()
         self.wait_engine_ready()
@@ -243,13 +263,6 @@ class MpClient:
             ),
         )
         self.engine_process.start()
-        self._finalizer = weakref.finalize(
-            self,
-            cleanup_resources,
-            processes=[self.engine_process],
-            sockets=[self.input_socket, self.output_socket],
-        )
-
         logger.debug("Engine process started.")
 
     def wait_engine_ready(self):
@@ -278,7 +291,6 @@ class MpClient:
             if not self_ref:
                 return
             logger.debug("Engine process has died.")
-            self_ref.is_dead = True
             self_ref.shutdown()
 
         logger.debug("Starting engine monitor thread...")
@@ -292,6 +304,17 @@ class MpClient:
 
 
 class EngineClient(MpClient):
+    def __init__(self, config: EngineConfig):
+        super().__init__(config)
+        self.poller = zmq.Poller()
+        self.poller.register(self.output_socket, zmq.POLLIN)
+
+    def profile(self, action: str):
+        if self.is_dead:
+            raise EngineDeadError()
+        frames = self.encoder.encode(EngineRequestProfile(action=action))
+        self.input_socket.send_multipart(frames, copy=False)
+
     def add_sequence(
         self,
         sequence_id: str,
@@ -320,19 +343,12 @@ class EngineClient(MpClient):
         self.input_socket.send_multipart(frames, copy=False)
 
     def get_output(self) -> list[EngineStepResult]:
-        self.output_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
-        while True:
-            # raise an exception if engine process has died
-            # this will help server to shutdown automatically
-            if self.is_dead:
-                raise EngineDeadError()
-            try:
-                frames = self.output_socket.recv_multipart(
-                    flags=zmq.NOBLOCK, copy=False
-                )
-                outputs = self.decoder.decode(frames)
-                assert isinstance(outputs, EngineOutputs)
-                break
-            except zmq.Again:
+        while not self.is_dead:
+            socks = dict(self.poller.poll(timeout=1000))
+            if self.output_socket not in socks:
                 continue
-        return outputs.outputs
+            frames = self.output_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
+            outputs = self.decoder.decode(frames)
+            assert isinstance(outputs, EngineOutputs)
+            return outputs.outputs
+        raise EngineDeadError()

@@ -79,15 +79,3 @@ def close_sockets(sockets: Sequence[zmq.Socket | zmq.asyncio.Socket]):
     for sock in sockets:
         if sock is not None:
             sock.close(linger=0)
-
-
-def cleanup_resources(
-    processes: list[BaseProcess] | BaseProcess | None = None,
-    sockets: list[zmq.Socket] | None = None,
-):
-    if processes:
-        shutdown(processes)
-    # ZMQ context termination can hang if the sockets
-    # aren't explicitly closed first.
-    if sockets:
-        close_sockets(sockets)

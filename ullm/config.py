@@ -15,6 +15,8 @@ class EngineConfig:
     context_len: int = 2048
 
     log_level: str = "info"
+    profile: bool = False
+    profile_dir: str = "./profiles"
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "EngineConfig":
@@ -32,6 +34,8 @@ class EngineConfig:
             enforce_eager=args.enforce_eager,
             context_len=args.context_len,
             log_level=args.log_level,
+            profile=args.profile,
+            profile_dir=args.profile_dir,
         )
 
 

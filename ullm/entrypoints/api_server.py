@@ -5,9 +5,9 @@ https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/api_serve
 
 import argparse
 import gc
-import logging
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from typing import Literal
 
 import fastapi
 import uvicorn
@@ -37,6 +37,7 @@ async def lifespan(app: fastapi.FastAPI):
         engine = LLM(config)
 
         app.state.model_name = args.model
+        app.state.engine = engine
         app.state.serving_chat = OpenAIServingChat(engine, args.model)
         app.state.serving_completion = OpenAIServingCompletion(engine, args.model)
 
@@ -91,6 +92,12 @@ async def create_chat_completion(
     return await serving_chat.create_chat_completion(request)
 
 
+async def profile(action: Literal["start", "stop"], raw_request: fastapi.Request):
+    engine = raw_request.app.state.engine
+    await engine.profile(action)
+    return {"status": "ok"}
+
+
 def run_server(args: argparse.Namespace):
     app.add_middleware(
         CORSMiddleware,
@@ -99,6 +106,10 @@ def run_server(args: argparse.Namespace):
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Register /profile endpoint only when profiling is enabled.
+    if getattr(args, "profile", False):
+        app.add_api_route("/profile", profile, methods=["POST"])
 
     server_config = ServerConfig.from_args(args)
     log_level = args.log_level
@@ -153,6 +164,17 @@ if __name__ == "__main__":
         type=str,
         default="info",
         help="Log level for the engine",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable profiling support",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default="./profiles",
+        help="Directory to save profiling results",
     )
     args = parser.parse_args()
 
