@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from functools import lru_cache
-import inspect
 import pickle
 from collections.abc import Sequence
 from types import FunctionType
-from typing import Any, Callable, TypeAlias, cast
+from typing import Any, TypeAlias, cast
 
 import cloudpickle
-import msgspec
 import numpy as np
 import torch
 import zmq

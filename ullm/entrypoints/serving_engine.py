@@ -73,6 +73,7 @@ class OpenAIServing:
             top_k=request.top_k if request.top_k is not None else -1,
             min_p=request.min_p if request.min_p is not None else 0.0,
             ignore_eos=request.ignore_eos if request.ignore_eos is not None else False,
-            max_new_tokens=request.max_tokens,
+            max_new_tokens=request.max_completion_tokens,
+            max_tokens=request.max_tokens,
             stop=stop_list,
         )

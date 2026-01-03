@@ -55,7 +55,8 @@ class CompletionRequest(BaseModel):
     model: str
     prompt: Union[str, List[str]]
     suffix: Optional[str] = None
-    max_tokens: Optional[int] = 16
+    max_completion_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
@@ -130,6 +131,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
+    max_completion_tokens: Optional[int] = None
     max_tokens: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
