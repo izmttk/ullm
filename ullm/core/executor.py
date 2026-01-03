@@ -470,13 +470,17 @@ class MultiWorkerClient:
 
         def worker_event_monitor():
             conns = [w.report_pipe for w in workers]
-            while True:
+            while conns:
                 for conn in wait(conns, timeout=1.0):
                     assert isinstance(conn, Connection)
                     try:
                         event = conn.recv()
                         assert isinstance(event, WorkerEvent)
+                        # Remove connection if worker is shutting down
+                        if event.type == WorkerEventType.SHUTDOWN:
+                            conns.remove(conn)
                     except (EOFError, OSError):
+                        conns.remove(conn)
                         continue
                     self_ref = weak_self()
                     if not self_ref:
