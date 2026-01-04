@@ -16,19 +16,34 @@ A lightweight vLLM-like LLM inference engine with radix-tree based KV cache, and
 - 张量并行（Tensor Parallelism）
 - 流水线并行（Pipeline Parallelism）
 - CUDA Graph 支持（仅 Decoding 阶段）
+- Torch Profiler 支持
 
 ## Requirements
 
 ```plaintext
-torch >= 2.8.0
-triton >= 3.0.0
-transformers >= 4.51.0
-fastapi >= 0.95.0
-flashinfer-python >= 0.2.0
+torch>=2.8.0
+numpy
+triton>=3.0.0
+transformers>=4.51.0,<=4.57.3
+fastapi>=0.95.0
+uvicorn
+flashinfer-python>=0.2.7
 psutil
+pyzmq>=25.0.0
+msgspec
+cloudpickle
 ```
 
 NOTE: 我发现当 nccl 版本 < 2.27.3 时，分布式环境的销毁会存在一些问题，建议升级 nvidia-nccl-cu12 至 2.27.3 及以上版本，torch 2.8.0 的依赖中已经包含该版本的 nccl。具体原因需要进一步调查。
+
+## Installation
+
+```bash
+git clone https://github.com/izmttk/ullm && cd ullm
+pip install -e .
+```
+
+当然你也可以选择不安装，直接在项目根目录下运行服务。
 
 ## Quick Start
 
@@ -39,7 +54,7 @@ example:
 python -m ullm.entrypoints.api_server --model Qwen3-0.6B --gpu-memory-utilization 0.9 --tp-size 2 --pp-size 2 --context-len 4096 --host 0.0.0.0 --port 8000
 
 usage: api_server.py [-h] [--host HOST] [--port PORT] --model MODEL [--gpu-memory-utilization GPU_MEMORY_UTILIZATION] [--max-bs MAX_BS] [--tp-size TP_SIZE] [--pp-size PP_SIZE]
-                     [--nccl-port NCCL_PORT] [--device-ids DEVICE_IDS] [--context-len CONTEXT_LEN] [--enforce-eager]
+                     [--nccl-port NCCL_PORT] [--device-ids DEVICE_IDS] [--context-len CONTEXT_LEN] [--enforce-eager] [--log-level LOG_LEVEL] [--profile] [--profile-dir PROFILE_DIR]
 
 LLM Distributed OpenAI-Compatible API Server
 
@@ -60,15 +75,31 @@ options:
   --context-len CONTEXT_LEN
                         Max context length of the model
   --enforce-eager       Enforce eager execution, disable CUDA graph
+  --log-level LOG_LEVEL
+                        Log level for the engine
+  --profile             Enable profiling support
+  --profile-dir PROFILE_DIR
+                        Directory to save profiling results
 ```
 
 Offline Inference
 
 ```py
-from core.llm import LLM
+from ullm import LLM, SamplingParams, EngineConfig
+import asyncio
 
-async main(prompt: str, *args, **kwargs):
-    llm = LLM(*args, **kwargs)
+async def main():
+    config = EngineConfig(
+        model="Qwen3-0.6B",
+        gpu_memory_utilization=0.9,
+        tp_size=2,
+        pp_size=2,
+        context_len=4096,
+        enforce_eager=False,
+    )
+    llm = LLM(config)
+
+    prompt = "Once upon a time"
     async for token in llm.generate(
         prompt,
         SamplingParams(
@@ -79,6 +110,9 @@ async main(prompt: str, *args, **kwargs):
         )
     ):
         print(token, end="", flush=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ## Benchmarks
@@ -103,9 +137,12 @@ Results:
 
 - [x] Graceful Shutdown
 - [x] Better Logging System
-- [ ] Multi proc communication optimizations
+- [x] Multi proc communication optimizations
+- [x] More Configurable Options
+- [x] Profiling
+- [ ] Data Transimission Overhead Optimization
+- [ ] Further Improvements based on Profiling
 - [ ] Overlap Scheduling
 - [ ] Benchmark Metrics on API Server
-- [ ] More Configurable Options
 
 Further development is still ongoing.

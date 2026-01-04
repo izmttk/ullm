@@ -1,8 +1,6 @@
-import os
 import time
 from random import randint, seed
-from core.llm import LLM
-from core.common import SamplingParams
+from ullm import LLM, SamplingParams, EngineConfig
 import asyncio
 
 async def consume_async_gen(async_gen):
@@ -15,8 +13,8 @@ async def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = "../Qwen3-0.6B"
-    llm = LLM(
+    path = "../Qwen3-8B"
+    config = EngineConfig(
         model=path,
         gpu_memory_utilization=0.8,
         max_bs=256,
@@ -26,6 +24,7 @@ async def main():
         device_ids=[0],
         context_len=4096,
     )
+    llm = LLM(config)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
@@ -43,7 +42,7 @@ async def main():
     total_tokens = sum(s.max_tokens or 0 for s in sampling_params)
     throughput = total_tokens / t
     print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
-    llm.shutdown()
+    await llm.shutdown()
 
 
 if __name__ == "__main__":
