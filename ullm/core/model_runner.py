@@ -208,11 +208,11 @@ class ModelRunner:
         positions: list[int] = []
 
         for seq in batch.seqs:
-            input_ids.extend(seq.token_ids[seq.cached_kv_len :])
-            positions.extend(range(seq.cached_kv_len, len(seq.token_ids)))
+            input_ids.extend(seq.token_ids[seq.num_cached_kv_indices :])
+            positions.extend(range(seq.num_cached_kv_indices, seq.num_tokens))
 
-        tensor_input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
-        tensor_positions = torch.tensor(positions, dtype=torch.long, device=self.device)
+        tensor_input_ids = torch.tensor(input_ids, device=self.device)
+        tensor_positions = torch.tensor(positions, device=self.device)
 
         return (
             tensor_input_ids,
@@ -252,7 +252,7 @@ class ModelRunner:
         last_indices = []
         cu_seq_len = 0
         for seq in batch.seqs:
-            cu_seq_len += len(seq.token_ids) - seq.cached_kv_len
+            cu_seq_len += seq.num_tokens - seq.num_cached_kv_indices
             last_indices.append(cu_seq_len - 1)
         return hidden_states[..., last_indices, :]
 

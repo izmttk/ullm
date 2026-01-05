@@ -348,17 +348,16 @@ class KVCacheManager:
 
     def match_prefix(self, seq: Sequence):
         # We need to reserve as least one token for model's input
-        key = seq.token_ids[: len(seq.token_ids) - 1]
+        key: list[int] = seq.token_ids[: seq.num_tokens - 1].tolist()
         cache_indices, last_node = self.radix_tree.match_prefix(key)
         if cache_indices:
-            seq.kv_indices = cache_indices
-            seq.cached_kv_len = len(cache_indices)
+            seq.set_cached_kv_indices(cache_indices)
             self.radix_tree.inc_ref(last_node)
             self.unfinished_sequences[seq.seq_id] = (len(cache_indices), last_node)
 
     def cache_sequence(self, seq: Sequence):
-        token_ids = seq.token_ids
-        kv_indices = seq.kv_indices
+        kv_indices: list[int] = seq.cached_kv_indices.tolist()
+        token_ids: list[int] = seq.token_ids[: seq.num_cached_kv_indices].tolist()
 
         new_prefix_len, new_last_node = self.radix_tree.insert(token_ids, kv_indices)
         old_prefix_len, old_last_node = self.unfinished_sequences.get(
@@ -380,9 +379,10 @@ class KVCacheManager:
             # 释放重复的kv cache slots
             self.kv_cache_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
             # 更新sequence的kv_indices的重复部分
-            seq.kv_indices[old_prefix_len:new_prefix_len] = new_indices[
+            kv_indices[old_prefix_len:new_prefix_len] = new_indices[
                 old_prefix_len:new_prefix_len
             ]
+            seq.set_cached_kv_indices(kv_indices)
 
         self.unfinished_sequences[seq.seq_id] = (len(new_indices), new_last_node)
         self.radix_tree.dec_ref(old_last_node)
@@ -393,5 +393,4 @@ class KVCacheManager:
             if seq.seq_id in self.unfinished_sequences:
                 del self.unfinished_sequences[seq.seq_id]
             # kv indices 交给 radix tree 管理了，此后 seq 中的 kv_indices 可能不再有效
-            seq.kv_indices.clear()
-            seq.cached_kv_len = 0
+            seq.clear_kv_indices()

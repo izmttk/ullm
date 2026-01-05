@@ -64,12 +64,12 @@ class AttentionBackend:
     ):
         page_size = 1
         seqlens_q = torch.tensor(
-            [len(seq.token_ids) - seq.cached_kv_len for seq in batch.seqs],
+            [seq.num_tokens - seq.num_cached_kv_indices for seq in batch.seqs],
             dtype=torch.int32,
             device=self.device,
         )  # (max_bs,)
         seqlens_kv = torch.tensor(
-            [len(seq.kv_indices) for seq in batch.seqs],
+            [seq.num_kv_indices for seq in batch.seqs],
             dtype=torch.int32,
             device=self.device,
         )  # (max_bs,)
@@ -98,10 +98,20 @@ class AttentionBackend:
         paged_kv_indices = []
         for seq, seq_paged_len in zip(batch.seqs, paged_seqlens_kv):
             seq_paged_len = int(seq_paged_len.item())
-            seq_paged_kv = torch.tensor(
-                seq.kv_indices + [-1] * (seq_paged_len - len(seq.kv_indices)),
-                dtype=torch.int32,
-                device=self.device,
+            seq_paged_kv = torch.cat(
+                [
+                    torch.tensor(
+                        seq.kv_indices,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    torch.full(
+                        (seq_paged_len * page_size - seq.num_kv_indices,),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                ]
             )
             paged_kv_indices.append(seq_paged_kv)
         paged_kv_indices = torch.cat(paged_kv_indices, dim=0)  # (num_total_pages,)
@@ -140,7 +150,7 @@ class AttentionBackend:
         output_kv_indices = torch.cat(
             [
                 torch.tensor(
-                    seq.kv_indices[seq.cached_kv_len :],
+                    seq.new_kv_indices,
                     dtype=torch.long,
                     device=self.device,
                 )
@@ -245,7 +255,7 @@ class AttentionBackend:
     ):
         # replay mode, fill in actual sizes
         bs = batch.num_seqs
-        kv_len = sum(len(seq.kv_indices) for seq in batch.seqs)
+        kv_len = sum(seq.num_kv_indices for seq in batch.seqs)
 
         paged_kv_indptr_buffer = graph.get_input_buffer("paged_kv_indptr_buffer")
         paged_kv_indices_buffer = graph.get_input_buffer("paged_kv_indices_buffer")
@@ -261,7 +271,7 @@ class AttentionBackend:
 
         # padding kv len will be set to 1
         seqlens_kv = torch.tensor(
-            [len(seq.kv_indices) for seq in batch.seqs] + [1] * (padded_bs - bs),
+            [seq.num_kv_indices for seq in batch.seqs] + [1] * (padded_bs - bs),
             dtype=torch.int32,
             device=self.device,
         )  # (padded_bs,)
@@ -291,7 +301,7 @@ class AttentionBackend:
             torch.cat(
                 [
                     torch.tensor(
-                        seq.kv_indices[seq.cached_kv_len :],
+                        seq.new_kv_indices,
                         dtype=torch.long,
                         device=self.device,
                     )

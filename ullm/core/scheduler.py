@@ -123,22 +123,24 @@ class Scheduler:
         """
         Allocate KV slots for all uncached tokens in the sequence.
         """
-        num_needed = len(seq.token_ids) - len(seq.kv_indices)
+        if seq.num_new_kv_indices > 0:
+            # free previously allocated new slots
+            self.kv_manager.free_slots(seq.new_kv_indices.tolist())
+        num_needed = seq.num_tokens - seq.num_cached_kv_indices
         # if kv slots are already allocated for all tokens, skip allocation
         if num_needed <= 0:
             return
         new_slots = self.kv_manager.alloc_slots(num_needed)
-        seq.kv_indices.extend(new_slots)
+        seq.set_new_kv_indices(new_slots)
 
     def free_kv_slots(self, seq: Sequence):
         """
         Free all KV slots associated with a sequence.
         """
-        if not seq.kv_indices:
+        if seq.num_kv_indices == 0:
             return
-        self.kv_manager.free_slots(seq.kv_indices)
-        seq.kv_indices.clear()
-        seq.cached_kv_len = 0
+        self.kv_manager.free_slots(seq.kv_indices.tolist())
+        seq.clear_kv_indices()
 
     def preempt(self, seq: Sequence):
         """
@@ -169,9 +171,8 @@ class Scheduler:
             return
 
         self.scheduled.remove(seq.seq_id)
-        seq.cached_kv_len = len(seq.kv_indices)
-        seq.token_ids.append(new_token_id)
-        seq.num_tokens = len(seq.token_ids)
+        seq.cache_new_kv_indices()
+        seq.append_new_tokens([new_token_id])
 
     def finish_sequence(self, seq: Sequence):
         """

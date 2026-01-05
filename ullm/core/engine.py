@@ -76,11 +76,9 @@ class Engine:
         if len(prompt_token_ids) > self.config.context_len:
             prompt_token_ids = prompt_token_ids[-self.config.context_len :]
 
-        seq = Sequence(
+        seq = Sequence.create(
             seq_id=sequence_id,
-            token_ids=prompt_token_ids,
-            num_tokens=len(prompt_token_ids),
-            prompt_len=len(prompt_token_ids),
+            prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
         )
         self.scheduler.add_sequence(seq)
@@ -151,8 +149,8 @@ class Engine:
                     new_token_id=new_token_id,
                     is_finished=is_finished,
                     finish_reason=finish_reason,
-                    num_prompt_tokens=seq.prompt_len,
-                    num_generated_tokens=seq.num_tokens - seq.prompt_len,
+                    num_prompt_tokens=seq.num_prompt_tokens,
+                    num_generated_tokens=seq.num_generated_tokens,
                 )
             )
 
@@ -174,7 +172,7 @@ class Engine:
             return True, FinishReason.LENGTH
         if (
             seq.sampling_params.max_new_tokens
-            and seq.num_tokens >= seq.prompt_len + seq.sampling_params.max_new_tokens
+            and seq.num_generated_tokens >= seq.sampling_params.max_new_tokens
         ):
             return True, FinishReason.LENGTH
 

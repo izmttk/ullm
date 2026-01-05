@@ -14,9 +14,8 @@ from msgspec import msgpack
 
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
-CUSTOM_TYPE_RAW_VIEW = 3
-CUSTOM_TYPE_NUMPY_ARRAY = 4
-CUSTOM_TYPE_TORCH_TENSOR = 5
+CUSTOM_TYPE_NUMPY_ARRAY = 3
+CUSTOM_TYPE_TORCH_TENSOR = 4
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 
@@ -85,7 +84,7 @@ class MsgpackEncoder:
         if not obj.shape or obj.nbytes < self.size_threshold:
             # Encode small arrays and scalars inline. Using this extension type
             # ensures we can avoid copying when decoding.
-            data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, arr_data)
+            data = arr_data
         else:
             # Otherwise encode index of backing buffer to avoid copy.
             data = len(self.aux_buffers)
@@ -114,7 +113,7 @@ class MsgpackEncoder:
         arr = obj.flatten().contiguous().view(torch.uint8).numpy()
         if obj.nbytes < self.size_threshold:
             # Smaller tensors are encoded inline, just like ndarrays.
-            data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, arr.data)
+            data = arr.data
         else:
             # Otherwise encode index of backing buffer to avoid copy.
             data = len(self.aux_buffers)
@@ -158,13 +157,13 @@ class MsgpackDecoder:
 
     def _load_ndarray(self, arr: bytes) -> np.ndarray:
         dtype_size = int.from_bytes(arr[0:4], "little")
-        dtype = self.decoder.decode(arr[4 : 4 + dtype_size])
+        dtype = msgpack.decode(arr[4 : 4 + dtype_size])
         shape_start = 4 + dtype_size
         shape_size = int.from_bytes(arr[shape_start : shape_start + 4], "little")
-        shape = self.decoder.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
+        shape = msgpack.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
         data_start = shape_start + 4 + shape_size
         data_size = int.from_bytes(arr[data_start : data_start + 4], "little")
-        data = self.decoder.decode(arr[data_start + 4 : data_start + 4 + data_size])
+        data = msgpack.decode(arr[data_start + 4 : data_start + 4 + data_size])
 
         # zero-copy decode. We assume the ndarray will not be kept around,
         # as it now locks the whole received message buffer in memory.
@@ -173,13 +172,13 @@ class MsgpackDecoder:
 
     def _load_tensor(self, arr: Any) -> torch.Tensor:
         dtype_size = int.from_bytes(arr[0:4], "little")
-        dtype = self.decoder.decode(arr[4 : 4 + dtype_size])
+        dtype = msgpack.decode(arr[4 : 4 + dtype_size])
         shape_start = 4 + dtype_size
         shape_size = int.from_bytes(arr[shape_start : shape_start + 4], "little")
-        shape = self.decoder.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
+        shape = msgpack.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
         data_start = shape_start + 4 + shape_size
         data_size = int.from_bytes(arr[data_start : data_start + 4], "little")
-        data = self.decoder.decode(arr[data_start + 4 : data_start + 4 + data_size])
+        data = msgpack.decode(arr[data_start + 4 : data_start + 4 + data_size])
 
         # Copy from inline representation, to decouple the memory storage
         # of the message from the original buffer. And also make Torch
@@ -196,8 +195,6 @@ class MsgpackDecoder:
         return arr.view(torch_dtype).view(shape)
 
     def ext_hook(self, code: int, data: memoryview) -> Any:
-        if code == CUSTOM_TYPE_RAW_VIEW:
-            return data
         if code == CUSTOM_TYPE_NUMPY_ARRAY:
             return self._load_ndarray(data)
         if code == CUSTOM_TYPE_TORCH_TENSOR:
