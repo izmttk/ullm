@@ -140,7 +140,7 @@ Results:
 - [x] Multi proc communication optimizations
 - [x] More Configurable Options
 - [x] Profiling
-- [ ] Data Transimission Overhead Optimization
+- [ ] Increamental Batch Scheduling and Stateful Workers
 - [ ] Further Improvements based on Profiling
 - [ ] Overlap Scheduling
 - [ ] Benchmark Metrics on API Server

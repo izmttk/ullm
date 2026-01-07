@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pickle
+import struct
 from collections.abc import Sequence
 from types import FunctionType
 from typing import Any, TypeAlias, cast
@@ -85,27 +86,38 @@ class MsgpackEncoder:
             # Encode small arrays and scalars inline. Using this extension type
             # ensures we can avoid copying when decoding.
             data = arr_data
+            inline = 1
+            inline_nbytes = data.nbytes if isinstance(data, memoryview) else len(data)
         else:
             # Otherwise encode index of backing buffer to avoid copy.
             data = len(self.aux_buffers)
+            inline = 0
+            inline_nbytes = 0
             self.aux_buffers.append(arr_data)
 
         # We serialize the ndarray as a tuple of native types.
         # The data is either inlined if small, or an index into a list of
         # backing buffers that we've stashed in `aux_buffers`.
-        dtype = self.encoder.encode(obj.dtype.str)
-        shape = self.encoder.encode(obj.shape)
-        data = self.encoder.encode(data)
-        return b"".join(
-            [
-                len(dtype).to_bytes(4, "little"),
-                dtype,
-                len(shape).to_bytes(4, "little"),
-                shape,
-                len(data).to_bytes(4, "little"),
-                data,
-            ]
+
+        dtype = obj.dtype.str
+
+        header = bytearray()
+        header.extend(
+            struct.pack(
+                "!IIII",
+                len(dtype),
+                obj.ndim,
+                inline,
+                inline_nbytes,
+            )
         )
+        header.extend(dtype.encode("ascii"))
+        header.extend(struct.pack("!" + "I" * obj.ndim, *obj.shape))
+        if isinstance(data, int):
+            header.extend(struct.pack("!I", data))
+        else:
+            header.extend(data)
+        return header
 
     def _dump_tensor(self, obj: torch.Tensor):
         assert self.aux_buffers is not None
@@ -114,23 +126,34 @@ class MsgpackEncoder:
         if obj.nbytes < self.size_threshold:
             # Smaller tensors are encoded inline, just like ndarrays.
             data = arr.data
+            inline = 1
+            inline_nbytes = data.nbytes
         else:
             # Otherwise encode index of backing buffer to avoid copy.
             data = len(self.aux_buffers)
+            inline = 0
+            inline_nbytes = 0
             self.aux_buffers.append(arr.data)
-        dtype = self.encoder.encode(str(obj.dtype).removeprefix("torch."))
-        shape = self.encoder.encode(obj.shape)
-        data = self.encoder.encode(data)
-        return b"".join(
-            [
-                len(dtype).to_bytes(4, "little"),
-                dtype,
-                len(shape).to_bytes(4, "little"),
-                shape,
-                len(data).to_bytes(4, "little"),
-                data,
-            ]
+
+        dtype = str(obj.dtype).removeprefix("torch.")
+
+        header = bytearray()
+        header.extend(
+            struct.pack(
+                "!IIII",
+                len(dtype),
+                obj.ndim,
+                inline,
+                inline_nbytes,
+            )
         )
+        header.extend(dtype.encode("ascii"))
+        header.extend(struct.pack("!" + "I" * obj.ndim, *obj.shape))
+        if isinstance(data, int):
+            header.extend(struct.pack("!I", data))
+        else:
+            header.extend(data)
+        return header
 
 
 class MsgpackDecoder:
@@ -155,44 +178,52 @@ class MsgpackDecoder:
         finally:
             self.aux_buffers = ()
 
-    def _load_ndarray(self, arr: bytes) -> np.ndarray:
-        dtype_size = int.from_bytes(arr[0:4], "little")
-        dtype = msgpack.decode(arr[4 : 4 + dtype_size])
-        shape_start = 4 + dtype_size
-        shape_size = int.from_bytes(arr[shape_start : shape_start + 4], "little")
-        shape = msgpack.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
-        data_start = shape_start + 4 + shape_size
-        data_size = int.from_bytes(arr[data_start : data_start + 4], "little")
-        data = msgpack.decode(arr[data_start + 4 : data_start + 4 + data_size])
+    def _load_ndarray(self, arr: memoryview) -> np.ndarray:
+        dtype_len, ndim, inline, inline_nbytes = struct.unpack_from("!IIII", arr, 0)
+        offset = struct.calcsize("!IIII")
+        dtype = arr[offset : offset + dtype_len].tobytes().decode("ascii")
+        offset += dtype_len
+        shape = struct.unpack_from("!" + "I" * ndim, arr, offset)
+        offset += struct.calcsize("!" + "I" * ndim)
 
-        # zero-copy decode. We assume the ndarray will not be kept around,
-        # as it now locks the whole received message buffer in memory.
-        buffer = self.aux_buffers[data] if isinstance(data, int) else data
+        if inline:
+            buffer = bytearray(arr[offset : offset + inline_nbytes])
+        else:
+            index = struct.unpack_from("!I", arr, offset)[0]
+            # zero-copy decode. We assume the ndarray will not be kept around,
+            # as it now locks the whole received message buffer in memory.
+            buffer = self.aux_buffers[index]
+
         return np.frombuffer(buffer, dtype=dtype).reshape(shape)
 
-    def _load_tensor(self, arr: Any) -> torch.Tensor:
-        dtype_size = int.from_bytes(arr[0:4], "little")
-        dtype = msgpack.decode(arr[4 : 4 + dtype_size])
-        shape_start = 4 + dtype_size
-        shape_size = int.from_bytes(arr[shape_start : shape_start + 4], "little")
-        shape = msgpack.decode(arr[shape_start + 4 : shape_start + 4 + shape_size])
-        data_start = shape_start + 4 + shape_size
-        data_size = int.from_bytes(arr[data_start : data_start + 4], "little")
-        data = msgpack.decode(arr[data_start + 4 : data_start + 4 + data_size])
+    def _load_tensor(self, arr: memoryview) -> torch.Tensor:
+        dtype_len, ndim, inline, inline_nbytes = struct.unpack_from("!IIII", arr, 0)
+        offset = 16
+        dtype = arr[offset : offset + dtype_len].tobytes().decode("ascii")
+        offset += dtype_len
+        shape = struct.unpack_from("!" + "I" * ndim, arr, offset)
+        offset += 4 * ndim
 
-        # Copy from inline representation, to decouple the memory storage
-        # of the message from the original buffer. And also make Torch
-        # not complain about a readonly memoryview.
-        buffer = self.aux_buffers[data] if isinstance(data, int) else bytearray(data)
+        if inline:
+            buffer = bytearray(arr[offset : offset + inline_nbytes])
+        else:
+            index = struct.unpack_from("!I", arr, offset)[0]
+            buffer = self.aux_buffers[index]
+
         torch_dtype = getattr(torch, dtype)
         assert isinstance(torch_dtype, torch.dtype)
         if not buffer:  # torch.frombuffer doesn't like empty buffers
             assert 0 in shape
             return torch.empty(shape, dtype=torch_dtype)
         # Create uint8 array
-        arr = torch.frombuffer(buffer, dtype=torch.uint8)
+        # Note: If you passed a zmq.Frame in decode method, and the frame was received
+        # with copy=False, the buffer here is a writable memoryview. The following
+        # torch.frombuffer call will run without warnings.
+        # But if you passed a zmq.Frame received with copy=True, or a bytes, the buffer
+        # here is read-only, and torch.frombuffer will issue a warning about it.
+        tensor = torch.frombuffer(buffer, dtype=torch.uint8)
         # Convert back to proper shape & type
-        return arr.view(torch_dtype).view(shape)
+        return tensor.view(torch_dtype).view(shape)
 
     def ext_hook(self, code: int, data: memoryview) -> Any:
         if code == CUSTOM_TYPE_NUMPY_ARRAY:
