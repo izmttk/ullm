@@ -3,8 +3,9 @@ from typing import Deque
 
 from ..config import EngineConfig
 from .common import (
-    ForwardBatch,
-    ForwardMode,
+    ScheduledCachedSequence,
+    ScheduledNewSequence,
+    SchedulerOutput,
     Sequence,
     SequenceStatus,
 )
@@ -48,6 +49,10 @@ class Scheduler:
         # it's a subset of running queue
         self.scheduled: set[str] = set()
 
+        # record preempted and finished seq_ids between scheduler steps
+        self.preempted: set[str] = set()
+        self.finished: set[str] = set()
+
         self.kv_manager = KVCacheManager(size=self.kv_cache_size)
 
     def add_sequence(self, seq: Sequence):
@@ -58,33 +63,40 @@ class Scheduler:
         self.waiting.append(seq)
         self.sequences[seq.seq_id] = seq
 
-    def schedule(self) -> ForwardBatch | None:
+    def schedule(self) -> SchedulerOutput | None:
         """
         Pick a batch of sequences to run next, returning a list of sequences.
         """
-        batch: list[Sequence] = []
+        # batch: list[Sequence] = []
+
+        scheduled_new_seqs: list[ScheduledNewSequence] = []
 
         # Prefill-first: schedule waiting sequences if any
-        while self.waiting and len(batch) < self.max_bs:
+        while self.waiting and len(scheduled_new_seqs) < self.max_bs:
             seq = self.waiting.popleft()
             # match prefix from KV cache on scheduling time
             self.kv_manager.match_prefix(seq)
             # Mark as running when scheduled for its first prefill
             seq.status = SequenceStatus.RUNNING
             self.alloc_kv_slots(seq)
-            batch.append(seq)
+            scheduled_new_seqs.append(ScheduledNewSequence.from_sequence(seq))
             self.running.append(seq)
             self.scheduled.add(seq.seq_id)
-        if batch:
-            return ForwardBatch(
-                forward_mode=ForwardMode.PREFILL,
-                num_seqs=len(batch),
-                seqs=batch,
+        if scheduled_new_seqs:
+            finished_seq_ids = list(self.finished)
+            self.finished.clear()
+            preempted_seq_ids = list(self.preempted)
+            self.preempted.clear()
+            return SchedulerOutput(
+                scheduled_new_seqs=scheduled_new_seqs,
+                finished_seq_ids=finished_seq_ids,
+                preempted_seq_ids=preempted_seq_ids,
             )
 
+        scheduled_cached_seqs: list[ScheduledCachedSequence] = []
         popped_seqs: list[Sequence] = []
         # Otherwise, schedule decode from running queue
-        while self.running and len(batch) < self.max_bs:
+        while self.running and len(scheduled_cached_seqs) < self.max_bs:
             seq = self.running.popleft()
             popped_seqs.append(seq)
             if seq.seq_id in self.scheduled:
@@ -106,15 +118,19 @@ class Scheduler:
                         self.running.appendleft(seq)
                         break
             if is_allocated:
-                batch.append(seq)
+                scheduled_cached_seqs.append(ScheduledCachedSequence.from_sequence(seq))
                 self.scheduled.add(seq.seq_id)
         # running queue may exists one seq (not enough slots for it)
         self.running.extendleft(reversed(popped_seqs))
-        if batch:
-            return ForwardBatch(
-                forward_mode=ForwardMode.DECODE,
-                num_seqs=len(batch),
-                seqs=batch,
+        if scheduled_cached_seqs:
+            finished_seq_ids = list(self.finished)
+            self.finished.clear()
+            preempted_seq_ids = list(self.preempted)
+            self.preempted.clear()
+            return SchedulerOutput(
+                scheduled_cached_seqs=scheduled_cached_seqs,
+                finished_seq_ids=finished_seq_ids,
+                preempted_seq_ids=preempted_seq_ids,
             )
 
         return None
@@ -153,6 +169,7 @@ class Scheduler:
         self.running.remove(seq)
         if seq.seq_id in self.scheduled:
             self.scheduled.remove(seq.seq_id)
+        self.preempted.add(seq.seq_id)
         self.free_kv_slots(seq)
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)  # Preempt to the front of waiting queue
@@ -186,6 +203,7 @@ class Scheduler:
 
         if seq.status == SequenceStatus.RUNNING:
             self.running.remove(seq)
+            self.finished.add(seq.seq_id)
             if seq.seq_id in self.scheduled:
                 self.scheduled.remove(seq.seq_id)
 

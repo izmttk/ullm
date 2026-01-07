@@ -15,7 +15,7 @@ from ..distributed.parallel_state import (
 )
 from ..layers.utils import IntermediateTensors
 from ..logger import init_logger
-from .common import ForwardBatch
+from .common import ForwardBatch, ForwardMode, SchedulerOutput, Sequence
 from .model_runner import ModelRunner
 
 logger = init_logger(__name__)
@@ -42,6 +42,8 @@ class Worker:
         self.context_len = config.context_len
 
         self.world_size = self.tp_size * self.pp_size
+
+        self.sequences: dict[str, Sequence] = {}
 
         if config.profile:
             profile_dir = Path(config.profile_dir)
@@ -107,10 +109,46 @@ class Worker:
     def initialize(self, gpu_memory_utilization: float):
         self.model_runner.initialize(gpu_memory_utilization)
 
-    def execute_model(self, batch: ForwardBatch) -> list[int] | None:
-        intermediate_tensors = None
+    def apply_sequence_updates(self, sched_output: SchedulerOutput) -> ForwardBatch:
+        for finished_seq_id in sched_output.finished_seq_ids:
+            if finished_seq_id in self.sequences:
+                del self.sequences[finished_seq_id]
+        for preempted_seq_id in sched_output.preempted_seq_ids:
+            if preempted_seq_id in self.sequences:
+                del self.sequences[preempted_seq_id]
 
-        if hasattr(self, "profiler") and getattr(self, "_profiler_active", False):
+        prefill_batch = []
+        for scheduled_new_seq in sched_output.scheduled_new_seqs:
+            seq = scheduled_new_seq.to_sequence()
+            self.sequences[seq.seq_id] = seq
+            prefill_batch.append(seq)
+        decode_batch = []
+        for scheduled_cached_seq in sched_output.scheduled_cached_seqs:
+            seq = self.sequences[scheduled_cached_seq.seq_id]
+            scheduled_cached_seq.apply_updates(seq)
+            decode_batch.append(seq)
+
+        assert not (prefill_batch and decode_batch), (
+            "Cannot have both prefill and decode batches."
+        )
+        if prefill_batch:
+            return ForwardBatch(
+                forward_mode=ForwardMode.PREFILL,
+                num_seqs=len(prefill_batch),
+                seqs=prefill_batch,
+            )
+        else:
+            return ForwardBatch(
+                forward_mode=ForwardMode.DECODE,
+                num_seqs=len(decode_batch),
+                seqs=decode_batch,
+            )
+
+    def execute_model(self, sched_output: SchedulerOutput) -> list[int] | None:
+        intermediate_tensors = None
+        batch = self.apply_sequence_updates(sched_output)
+
+        if hasattr(self, "profiler") and self.profiler_started:
             self.profiler.step()
 
         if not get_pp_group().is_first_rank:

@@ -173,3 +173,66 @@ class ForwardBatch:
     forward_mode: ForwardMode
     num_seqs: int
     seqs: list[Sequence]
+
+
+@dataclass
+class ScheduledNewSequence:
+    seq_id: str
+    sampling_params: SamplingParams
+    token_ids: np.ndarray
+    cached_kv_indices: np.ndarray
+    new_kv_indices: np.ndarray
+
+    @staticmethod
+    def from_sequence(seq: Sequence) -> "ScheduledNewSequence":
+        return ScheduledNewSequence(
+            seq_id=seq.seq_id,
+            sampling_params=seq.sampling_params,
+            token_ids=seq.token_ids,
+            cached_kv_indices=seq.cached_kv_indices,
+            new_kv_indices=seq.new_kv_indices,
+        )
+
+    def to_sequence(self) -> Sequence:
+        seq = Sequence(
+            seq_id=self.seq_id,
+            status=SequenceStatus.RUNNING,
+            token_ids=self.token_ids,
+            num_prompt_tokens=len(self.cached_kv_indices),
+            sampling_params=self.sampling_params,
+            cached_kv_indices=self.cached_kv_indices,
+            new_kv_indices=self.new_kv_indices,
+        )
+        return seq
+
+
+@dataclass
+class ScheduledCachedSequence:
+    seq_id: str
+    sampling_params: SamplingParams
+    new_token_ids: np.ndarray
+    new_kv_indices: np.ndarray
+
+    @staticmethod
+    def from_sequence(seq: Sequence) -> "ScheduledCachedSequence":
+        return ScheduledCachedSequence(
+            seq_id=seq.seq_id,
+            sampling_params=seq.sampling_params,
+            new_token_ids=seq.token_ids[seq.num_cached_kv_indices :],
+            new_kv_indices=seq.new_kv_indices,
+        )
+
+    def apply_updates(self, seq: Sequence):
+        assert seq.seq_id == self.seq_id
+        seq.sampling_params = self.sampling_params
+        seq.cache_new_kv_indices()
+        seq.append_new_tokens(self.new_token_ids.tolist())
+        seq.set_new_kv_indices(self.new_kv_indices.tolist())
+
+
+@dataclass
+class SchedulerOutput:
+    scheduled_new_seqs: list[ScheduledNewSequence] = field(default_factory=list)
+    scheduled_cached_seqs: list[ScheduledCachedSequence] = field(default_factory=list)
+    finished_seq_ids: list[str] = field(default_factory=list)
+    preempted_seq_ids: list[str] = field(default_factory=list)

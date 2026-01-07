@@ -11,8 +11,8 @@ from ..logger import init_logger
 from .common import (
     EngineStepResult,
     FinishReason,
-    ForwardBatch,
     SamplingParams,
+    SchedulerOutput,
     Sequence,
 )
 from .executor import Executor
@@ -42,7 +42,9 @@ class Engine:
             kv_cache_size=kv_cache_size,
         )
 
-        self.pp_queue: queue.Queue[tuple[Future[list[int]], ForwardBatch]] | None = None
+        self.pp_queue: queue.Queue[tuple[Future[list[int]], SchedulerOutput]] | None = (
+            None
+        )
         if self.config.pp_size > 1:
             self.pp_queue = queue.Queue(self.config.pp_size)
 
@@ -105,38 +107,49 @@ class Engine:
             # 注意当开启了流水线并行时，step 可能会返回空列表
             return self.step_with_pp()
 
-        batch = self.scheduler.schedule()
-        if not batch:
+        sched_output = self.scheduler.schedule()
+        if not sched_output:
             return []
-        fut = self.model_executor.execute_model(batch)
+        fut = self.model_executor.execute_model(sched_output)
         output_ids = fut.result()
-        outputs = self.update_from_output(batch, output_ids)
+        outputs = self.update_from_output(sched_output, output_ids)
         return outputs
 
     def step_with_pp(self) -> list[EngineStepResult]:
         assert self.pp_queue is not None
         outputs: list[EngineStepResult] = []
-        batch = None
+        sched_output = None
         if not self.pp_queue.full():
-            batch = self.scheduler.schedule()
-            if batch:
-                fut = self.model_executor.execute_model(batch)
-                self.pp_queue.put_nowait((fut, batch))
+            sched_output = self.scheduler.schedule()
+            if sched_output:
+                fut = self.model_executor.execute_model(sched_output)
+                self.pp_queue.put_nowait((fut, sched_output))
         # 如果 batch 为 None，说明要么没有新请求，要么 pp 队列已满不允许调度
-        if batch is None and not self.pp_queue.empty():
+        if sched_output is None and not self.pp_queue.empty():
             (fut, sched_batch) = self.pp_queue.get_nowait()
             output_ids = fut.result()  # 阻塞等待结果
             outputs = self.update_from_output(sched_batch, output_ids)
 
         return outputs
 
-    def update_from_output(self, batch: ForwardBatch, output_ids: list[int]):
+    def update_from_output(self, sched_output: SchedulerOutput, output_ids: list[int]):
         """
         Update sequences based on the model output.
         """
         outputs: list[EngineStepResult] = []
+        assert not (
+            sched_output.scheduled_new_seqs and sched_output.scheduled_cached_seqs
+        ), "Cannot have both scheduled new and cached sequences in one batch."
+        if sched_output.scheduled_new_seqs:
+            batch = sched_output.scheduled_new_seqs
+        else:
+            batch = sched_output.scheduled_cached_seqs
         # Update sequences with the model output
-        for seq, new_token_id in zip(batch.seqs, output_ids):
+        for sched_seq, new_token_id in zip(batch, output_ids):
+            seq = self.scheduler.get_sequence(sched_seq.seq_id)
+            if seq is None:
+                continue
+
             self.scheduler.update_sequence(seq, new_token_id)
 
             is_finished, finish_reason = self._is_sequence_finished(seq)
@@ -174,6 +187,10 @@ class Engine:
             seq.sampling_params.max_new_tokens
             and seq.num_generated_tokens >= seq.sampling_params.max_new_tokens
         ):
+            return True, FinishReason.LENGTH
+
+        # Check for context length
+        if seq.num_tokens >= self.config.context_len:
             return True, FinishReason.LENGTH
 
         return False, None

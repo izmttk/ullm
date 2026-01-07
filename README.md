@@ -16,6 +16,7 @@ A lightweight vLLM-like LLM inference engine with radix-tree based KV cache, and
 - 张量并行（Tensor Parallelism）
 - 流水线并行（Pipeline Parallelism）
 - CUDA Graph 支持（仅 Decoding 阶段）
+- 增量调度和有状态的 Worker
 - Torch Profiler 支持
 
 ## Requirements
@@ -140,7 +141,7 @@ Results:
 - [x] Multi proc communication optimizations
 - [x] More Configurable Options
 - [x] Profiling
-- [ ] Increamental Batch Scheduling and Stateful Workers
+- [x] Increamental Batch Scheduling and Stateful Workers
 - [ ] Further Improvements based on Profiling
 - [ ] Overlap Scheduling
 - [ ] Benchmark Metrics on API Server

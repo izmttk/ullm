@@ -24,7 +24,7 @@ from ..config import EngineConfig
 from ..core.worker import Worker
 from ..logger import init_logger
 from ..utils import close_sockets, shutdown
-from .common import ForwardBatch
+from .common import SchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -57,7 +57,7 @@ class RpcRequestBase(
 
 class RpcRequestExecuteModel(RpcRequestBase, kw_only=True):
     method_name: str = "execute_model"
-    batch: ForwardBatch
+    sched_output: SchedulerOutput
 
 
 class RpcRequestInitialize(RpcRequestBase, kw_only=True):
@@ -121,7 +121,7 @@ RpcResponse = (
 def handle_rpc_request(worker: Worker, req: RpcRequest):
     try:
         if isinstance(req, RpcRequestExecuteModel):
-            result = worker.execute_model(req.batch)
+            result = worker.execute_model(req.sched_output)
             return RpcResponseExecuteModel(
                 request_id=req.request_id,
                 result=result,
@@ -559,8 +559,8 @@ class Executor(MultiWorkerClient):
         self.pending[request_id] = future
         return future
 
-    def execute_model(self, batch: ForwardBatch) -> Future[list[int]]:
-        return self.submit(RpcRequestExecuteModel(batch=batch))
+    def execute_model(self, sched_output: SchedulerOutput) -> Future[list[int]]:
+        return self.submit(RpcRequestExecuteModel(sched_output=sched_output))
 
     def initialize(self):
         self.submit(
