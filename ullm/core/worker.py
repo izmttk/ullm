@@ -29,8 +29,7 @@ class Worker:
         tp_rank: int,
         pp_rank: int,
     ):
-        self.model = config.model
-        self.max_bs = config.max_bs
+        self.config = config
 
         self.rank = rank
         self.tp_rank = tp_rank
@@ -38,8 +37,6 @@ class Worker:
         self.tp_size = config.tp_size
         self.pp_size = config.pp_size
         self.nccl_port = config.nccl_port
-        self.enforce_eager = config.enforce_eager
-        self.context_len = config.context_len
 
         self.world_size = self.tp_size * self.pp_size
 
@@ -81,12 +78,9 @@ class Worker:
 
         self.device = torch.device(f"cuda:{self.rank}")
         self.model_runner = ModelRunner(
-            model=self.model,
-            max_bs=self.max_bs,
+            config=self.config,
             rank=self.rank,
             device=self.device,
-            enforce_eager=self.enforce_eager,
-            context_len=self.context_len,
         )
         logger.debug(
             f"Worker {self.rank} started with TP rank {self.tp_rank}, PP rank {self.pp_rank}."

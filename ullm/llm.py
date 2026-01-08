@@ -22,6 +22,7 @@ def init_tokenizer(model: str) -> PreTrainedTokenizer:
 
 class LLM:
     def __init__(self, config: EngineConfig):
+        self.config = config
         self.engine = EngineClient(config)
         self.tokenizer = init_tokenizer(config.model)
 
@@ -75,7 +76,7 @@ class LLM:
     async def generate(
         self,
         prompts: str | list[int],
-        params: SamplingParams,
+        params: SamplingParams | None = None,
         sequence_id: str | None = None,
     ) -> AsyncGenerator[GenerateOutput, None]:
         if sequence_id is None:
@@ -86,6 +87,8 @@ class LLM:
             else:
                 token_ids = self.tokenize([prompts])[0]
             q: asyncio.Queue[GenerateOutput | Exception | None] = asyncio.Queue()
+
+            params = params or self.engine.config.get_default_sampling_params()
 
             if params.eos_token_id == -1:
                 params.eos_token_id = self.tokenizer.eos_token_id  # type: ignore

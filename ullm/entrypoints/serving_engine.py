@@ -60,20 +60,26 @@ class OpenAIServing:
     def _extract_sampling_params(
         self, request: Union[CompletionRequest, ChatCompletionRequest]
     ) -> SamplingParams:
-        stop_list = []
-        if isinstance(request.stop, str):
-            stop_list = [request.stop]
-        elif isinstance(request.stop, list):
-            stop_list = request.stop
-
-        return SamplingParams(
-            n=request.n if request.n is not None else 1,
-            temperature=request.temperature if request.temperature is not None else 1.0,
-            top_p=request.top_p if request.top_p is not None else 1.0,
-            top_k=request.top_k if request.top_k is not None else -1,
-            min_p=request.min_p if request.min_p is not None else 0.0,
-            ignore_eos=request.ignore_eos if request.ignore_eos is not None else False,
-            max_new_tokens=request.max_completion_tokens,
-            max_tokens=request.max_tokens,
-            stop=stop_list,
-        )
+        params = self.engine.config.get_default_sampling_params()
+        if request.n is not None:
+            params.n = request.n
+        if request.temperature is not None:
+            params.temperature = request.temperature
+        if request.top_p is not None:
+            params.top_p = request.top_p
+        if request.top_k is not None:
+            params.top_k = request.top_k
+        if request.min_p is not None:
+            params.min_p = request.min_p
+        if request.ignore_eos is not None:
+            params.ignore_eos = request.ignore_eos
+        if request.max_completion_tokens is not None:
+            params.max_new_tokens = request.max_completion_tokens
+        if request.max_tokens is not None:
+            params.max_tokens = request.max_tokens
+        if request.stop is not None:
+            if isinstance(request.stop, str):
+                params.stop = [request.stop]
+            elif isinstance(request.stop, list):
+                params.stop = request.stop
+        return params

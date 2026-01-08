@@ -1,5 +1,9 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
+
+from transformers import AutoConfig, GenerationConfig, PretrainedConfig
+
+from .core.common import SamplingParams
 
 
 @dataclass
@@ -17,6 +21,45 @@ class EngineConfig:
     log_level: str = "info"
     profile: bool = False
     profile_dir: str = "./profiles"
+
+    hf_config: PretrainedConfig = field(init=False)
+    hf_generation_config: GenerationConfig | None = field(init=False)
+
+    def try_get_generation_config(self) -> GenerationConfig | None:
+        try:
+            return GenerationConfig.from_pretrained(self.model)
+        except OSError:  # Not found
+            try:
+                return GenerationConfig.from_model_config(self.hf_config)
+            except OSError:  # Not found
+                return None
+
+    def __post_init__(self):
+        self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        self.hf_generation_config = self.try_get_generation_config()
+
+    def get_default_sampling_params(self) -> SamplingParams:
+        if self.hf_generation_config is None:
+            return SamplingParams()
+
+        config = self.hf_generation_config.to_dict()
+        default_params = asdict(SamplingParams())
+        available_params = [
+            "repetition_penalty",
+            "temperature",
+            "top_k",
+            "top_p",
+            "min_p",
+        ]
+
+        default_sampling_params = {}
+        for param, value in default_params.items():
+            if param in available_params:
+                default_sampling_params[param] = config.get(param, value)
+            else:
+                default_sampling_params[param] = value
+
+        return SamplingParams(**default_sampling_params)
 
     @staticmethod
     def from_args(args: argparse.Namespace) -> "EngineConfig":

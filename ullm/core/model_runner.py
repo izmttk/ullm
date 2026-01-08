@@ -2,8 +2,9 @@ import gc
 import os
 
 import torch
-from transformers import AutoConfig, PretrainedConfig
+from transformers import PretrainedConfig
 
+from ..config import EngineConfig
 from ..distributed.communication_op import all_gather
 from ..distributed.parallel_state import get_pp_group, get_tp_group
 from ..distributed.utils import get_pp_indices
@@ -18,14 +19,6 @@ from .cuda_graph import CUDAGraph
 from .kv_cache import KVCachePool
 
 logger = init_logger(__name__)
-
-_STR_DTYPE_TO_TORCH_DTYPE = {
-    "half": torch.float16,
-    "float16": torch.float16,
-    "float": torch.float32,
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-}
 
 
 def set_cuda_arch():
@@ -42,9 +35,19 @@ def get_model_config_per_gpu(
     pp_rank: int,
 ):
     hf_dtype = getattr(hf_config, "dtype", None) or getattr(
-        hf_config, "torch_dtype", "float16"
+        hf_config, "torch_dtype", None
     )
-    dtype: torch.dtype = _STR_DTYPE_TO_TORCH_DTYPE[hf_dtype]
+    dtype = None
+    if hf_dtype is None:
+        hf_dtype = "float16"
+    if isinstance(hf_dtype, torch.dtype):
+        dtype = hf_dtype
+    elif isinstance(hf_dtype, str):
+        dtype = getattr(torch, hf_dtype, None)
+        if not isinstance(dtype, torch.dtype):
+            dtype = None
+    if dtype is None:
+        raise ValueError(f"Unsupported dtype: {hf_dtype}")
 
     start_layer, end_layer = get_pp_indices(
         hf_config.num_hidden_layers, pp_rank, pp_size
@@ -72,19 +75,21 @@ def get_model_config_per_gpu(
 class ModelRunner:
     def __init__(
         self,
-        model: str,
-        max_bs: int,
+        config: EngineConfig,
         rank: int,
         device: torch.device,
-        enforce_eager: bool = False,
-        context_len: int = 2048,
     ):
-        self.model_path = model
-        self.max_bs = max_bs
+        self.config = config
+        self.hf_config = self.config.hf_config
+
+        self.model_path = config.model
+        self.max_bs = config.max_bs
+        self.enforce_eager = config.enforce_eager
+        self.context_len = config.context_len
+
         self.rank = rank
         self.device = device
-        self.enforce_eager = enforce_eager
-        self.context_len = context_len
+
         set_cuda_arch()
 
     def initialize(self, gpu_memory_utilization: float = 0.9):
@@ -125,21 +130,15 @@ class ModelRunner:
             self.cuda_graph = None
 
     def load_model(self):
-        hf_config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
-
-        architectures = getattr(hf_config, "architectures", [])
+        architectures = getattr(self.hf_config, "architectures", [])
         ModelClass = None
-        ConfigClass = None
         for arch in architectures:
             if arch in MODEL_REGISTRY:
-                ModelClass, ConfigClass = MODEL_REGISTRY[arch]
+                ModelClass = MODEL_REGISTRY[arch]
                 break
-        assert ModelClass is not None and ConfigClass is not None, (
-            f"Model arch {hf_config.architectures} not supported."
+        assert ModelClass is not None, (
+            f"Model arch {self.hf_config.architectures} not supported."
         )
-
-        self.hf_config = ConfigClass()
-        self.hf_config.update(hf_config.to_dict())
 
         logger.debug(
             f"Rank {self.rank} loading model {self.model_path} with type {ModelClass.__name__}."
@@ -169,8 +168,7 @@ class ModelRunner:
         )
 
         torch.set_default_dtype(self.dtype)
-
-        self.model = ModelClass(self.hf_config)
+        self.model = ModelClass(self.hf_config)  # type: ignore
         self.model.to(self.device)
 
         self.sampler = Sampler()
