@@ -5,9 +5,7 @@ import torch
 from transformers import PretrainedConfig
 
 from ..config import EngineConfig
-from ..distributed.communication_op import all_gather
-from ..distributed.parallel_state import get_pp_group, get_tp_group
-from ..distributed.utils import get_pp_indices
+from ..distributed import all_gather, get_pp_group, get_pp_indices, get_tp_group
 from ..layers.attention import AttentionBackend, attention_kv_cache
 from ..layers.sampler import Sampler
 from ..layers.utils import IntermediateTensors

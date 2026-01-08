@@ -4,14 +4,15 @@ from pathlib import Path
 import torch
 
 from ..config import EngineConfig
-from ..distributed.communication_op import recv_tensor_dict, send_tensor_dict
-from ..distributed.parallel_state import (
+from ..distributed import (
     destroy_distributed_environment,
     destroy_model_parallel,
     get_pp_group,
     get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
+    recv_tensor_dict,
+    send_tensor_dict,
 )
 from ..layers.utils import IntermediateTensors
 from ..logger import init_logger

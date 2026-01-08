@@ -7,7 +7,7 @@ from safetensors import safe_open
 from torch import nn
 from tqdm import tqdm
 
-from .distributed.parallel_state import get_world_group, is_initialized
+from .distributed import get_world_group, is_initialized
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:

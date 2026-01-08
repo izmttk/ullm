@@ -57,7 +57,7 @@ class ColoredFormatter(logging.Formatter):
 
 @lru_cache
 def debug_once(logger: logging.Logger, msg: str, *args) -> None:
-    from .distributed.parallel_state import get_world_group
+    from .distributed import get_world_group
 
     if not get_world_group().is_first_rank:
         return
@@ -67,7 +67,7 @@ def debug_once(logger: logging.Logger, msg: str, *args) -> None:
 
 @lru_cache
 def info_once(logger: logging.Logger, msg: str, *args) -> None:
-    from .distributed.parallel_state import get_world_group
+    from .distributed import get_world_group
 
     if not get_world_group().is_first_rank:
         return
@@ -77,7 +77,7 @@ def info_once(logger: logging.Logger, msg: str, *args) -> None:
 
 @lru_cache
 def warning_once(logger: logging.Logger, msg: str, *args) -> None:
-    from .distributed.parallel_state import get_world_group
+    from .distributed import get_world_group
 
     if not get_world_group().is_first_rank:
         return

@@ -5,8 +5,7 @@ import torch
 from torch import nn
 from transformers.models.qwen3 import Qwen3Config
 
-from ..distributed.parallel_state import get_pp_group, get_tp_group
-from ..distributed.utils import get_pp_indices
+from ..distributed import get_pp_group, get_pp_indices, get_tp_group
 from ..layers.activation import SiluAndMul
 from ..layers.attention import Attention
 from ..layers.layernorm import RMSNorm

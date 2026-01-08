@@ -2,11 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..distributed.communication_op import (
+from ..distributed import (
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from ..distributed.parallel_state import get_tp_group
 from .utils import divide, ensure_divisibility
 
 
