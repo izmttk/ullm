@@ -5,7 +5,6 @@ import os
 import queue
 import signal
 import threading
-import time
 import traceback
 import uuid
 import weakref
@@ -175,7 +174,6 @@ def run_worker_loop(
     signal.signal(signal.SIGINT, signal_handler)
 
     worker: Worker | None = None
-    heartbeat_thread: threading.Thread | None = None
     try:
         ctx = zmq.Context()
 
@@ -215,17 +213,7 @@ def run_worker_loop(
         worker = Worker(config=config, rank=rank, tp_rank=tp_rank, pp_rank=pp_rank)
         worker.init_environment()
 
-        def heartbeat_loop():
-            while not shutdown_requested:
-                try:
-                    report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.READY))
-                except (BrokenPipeError, OSError):
-                    break  # 管道已关闭，退出心跳线程
-                time.sleep(5)
-
-        heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-        heartbeat_thread.start()
-
+        report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.READY))
         while True:
             req = input_queue.get()  # 等待输入
             resp = handle_rpc_request(worker, req)  # 处理请求
@@ -236,8 +224,6 @@ def run_worker_loop(
         logger.debug("Keyboard interrupt received, shutting down worker process.")
     except Exception:
         shutdown_requested = True
-        if heartbeat_thread and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         try:
             report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.ERROR))
         except (BrokenPipeError, OSError):
@@ -248,8 +234,6 @@ def run_worker_loop(
             logger.exception(f"Worker {rank} encountered an error.")
     finally:
         shutdown_requested = True
-        if heartbeat_thread and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         try:
             report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.SHUTDOWN))
         except (BrokenPipeError, OSError):
@@ -265,6 +249,7 @@ class WorkerProc:
     rank: int
     is_driver_worker: bool
     report_pipe: Connection
+    is_ready: bool = False
 
     @staticmethod
     def create(
@@ -349,6 +334,17 @@ class MultiWorkerClient:
         self._finalizer = weakref.finalize(self, cleanup_resources)
 
         self.set_envs()
+
+        self.all_workers_ready = threading.Event()
+
+        def ready_waiter(event: WorkerEvent):
+            if event.rank < len(self.workers):
+                self.workers[event.rank].is_ready = True
+            all_ready = all(w.is_ready for w in self.workers)
+            if all_ready:
+                self.all_workers_ready.set()
+
+        self.add_worker_event_listener(WorkerEventType.READY, ready_waiter)
         self.start_workers()
         self.start_worker_monitor()
         self.wait_worker_ready()
@@ -413,33 +409,12 @@ class MultiWorkerClient:
 
     def wait_worker_ready(self):
         logger.debug("Waiting for all workers to be ready...")
-        unready = [w.rank for w in self.workers]
-        q: queue.Queue[WorkerEvent] = queue.Queue()
-        dead_event = threading.Event()
-
-        def ready_callback(event: WorkerEvent):
-            q.put(event)
-
-        def dead_callback(event: WorkerEvent):
-            dead_event.set()
-
-        self.add_worker_event_listener(WorkerEventType.READY, ready_callback)
-        self.add_worker_event_listener(WorkerEventType.DEAD, dead_callback)
-
-        while unready:
-            if dead_event.is_set():
+        while not self.all_workers_ready.wait(timeout=1.0):
+            if self.is_dead:
                 raise RuntimeError(
                     "Worker process encountered an error during startup."
                 )
-            try:
-                event = q.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            if event.rank in unready:
-                unready.remove(event.rank)
 
-        self.remove_worker_event_listener(WorkerEventType.READY, ready_callback)
-        self.remove_worker_event_listener(WorkerEventType.DEAD, dead_callback)
         logger.debug("All workers are ready.")
 
     def start_worker_monitor(self):

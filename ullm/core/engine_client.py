@@ -3,7 +3,6 @@ import logging
 import queue
 import signal
 import threading
-import time
 import weakref
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
@@ -105,7 +104,6 @@ def run_engine_loop(
     signal.signal(signal.SIGINT, signal_handler)
 
     engine: Engine | None = None
-    heartbeat_thread: threading.Thread | None = None
     STOP_SENTINEL = type("STOP_SENTINEL", (), {})
     try:
         ctx = zmq.Context()
@@ -144,17 +142,7 @@ def run_engine_loop(
 
         engine = Engine(config=config, failure_callback=failure_callback)
 
-        def heartbeat_loop():
-            while not shutdown_requested:
-                try:
-                    report_pipe.send(EngineEvent(EngineEventType.READY))
-                except (BrokenPipeError, OSError):
-                    break  # 管道已关闭，退出心跳线程
-                time.sleep(5)
-
-        heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-        heartbeat_thread.start()
-
+        report_pipe.send(EngineEvent(EngineEventType.READY))
         while True:
             # 如果 engine 中没有未完成的请求了，即 engine 的 waiting 和 running 队列都空了
             # 则在调用下一次 step 之前，阻塞等待一个新的请求
@@ -180,8 +168,6 @@ def run_engine_loop(
         logger.debug("Keyboard interrupt received, shutting down engine process.")
     except Exception:
         shutdown_requested = True
-        if heartbeat_thread and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         try:
             report_pipe.send(EngineEvent(EngineEventType.ERROR))
         except (BrokenPipeError, OSError):
@@ -192,8 +178,6 @@ def run_engine_loop(
             logger.exception("Engine encountered an error.")
     finally:
         shutdown_requested = True
-        if heartbeat_thread and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         try:
             report_pipe.send(EngineEvent(EngineEventType.SHUTDOWN))
         except (BrokenPipeError, OSError):

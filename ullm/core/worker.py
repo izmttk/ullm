@@ -92,7 +92,8 @@ class Worker:
         # See: https://github.com/pytorch/pytorch/issues/115388
         torch.cuda.synchronize()
         if (
-            hasattr(self.model_runner, "cuda_graph")
+            hasattr(self, "model_runner")
+            and hasattr(self.model_runner, "cuda_graph")
             and self.model_runner.cuda_graph is not None
         ):
             self.model_runner.cuda_graph.clear()
