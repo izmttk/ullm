@@ -164,10 +164,8 @@ def run_engine_loop(
             if outputs:
                 output_queue.put_nowait(EngineOutputs(outputs=outputs))
     except SystemExit:
-        shutdown_requested = True
         logger.debug("Keyboard interrupt received, shutting down engine process.")
     except Exception:
-        shutdown_requested = True
         try:
             report_pipe.send(EngineEvent(EngineEventType.ERROR))
         except (BrokenPipeError, OSError):

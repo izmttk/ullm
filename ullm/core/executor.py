@@ -220,10 +220,8 @@ def run_worker_loop(
             if output_queue is not None:
                 output_queue.put_nowait(resp)  # 发送响应
     except SystemExit:
-        shutdown_requested = True
         logger.debug("Keyboard interrupt received, shutting down worker process.")
     except Exception:
-        shutdown_requested = True
         try:
             report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.ERROR))
         except (BrokenPipeError, OSError):

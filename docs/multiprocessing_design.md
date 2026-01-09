@@ -50,7 +50,6 @@ stateDiagram-v2
   STARTUP --> READY:初始化成功
   STARTUP --> ERROR:初始化失败
   STARTUP --> DEAD:KILL
-  READY --> READY:定时心跳
   READY --> ERROR:运行时异常
   READY --> SHUTDOWN:SIGINT/SIGTERM
   READY --> DEAD:KILL
@@ -92,37 +91,21 @@ def run_busy_loop(
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    heartbeat_thread = None
     try:
         # 执行初始化逻辑
-        def heartbeat_loop():
-            while not shutdown_requested:
-                try:
-                    report_pipe.send(EngineEvent(EngineEventType.READY))
-                except (BrokenPipeError, OSError):
-                    break  # 管道已关闭，退出心跳线程
-                time.sleep(5)
-
-        heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-        heartbeat_thread.start()
+        report_pipe.send(Event(EventType.READY))
 
         while True:
             ...  # 执行主循环逻辑
     except SystemExit:
-        shutdown_requested = True
-        raise
+        pass  # 尝试正常退出
     except Exception:
-        shutdown_requested = True
-        if heartbeat_thread and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         try:
-            report_pipe.send(EngineEvent(EngineEventType.ERROR))
+            report_pipe.send(Event(EventType.ERROR))
         except (BrokenPipeError, OSError):
             pass  # 管道已关闭是正常的
     finally:
         shutdown_requested = True
-        if heartbeat_thread and heartbeat_thread.is_alive():
-            heartbeat_thread.join()
         try:
             report_pipe.send(Event(EventType.SHUTDOWN))
         except (BrokenPipeError, OSError):

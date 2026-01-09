@@ -33,9 +33,10 @@ psutil
 pyzmq>=25.0.0
 msgspec
 cloudpickle
+tqdm
 ```
 
-NOTE: 我发现当 nccl 版本 < 2.27.3 时，分布式环境的销毁会存在一些问题，建议升级 nvidia-nccl-cu12 至 2.27.3 及以上版本，torch 2.8.0 的依赖中已经包含该版本的 nccl。具体原因需要进一步调查。
+NOTE: 我发现当 nccl 版本 < 2.27.3 时，分布式通信和环境销毁可能会存在卡死的问题，建议升级 nvidia-nccl-cu12 至 2.27.3 及以上版本，torch 2.8.0 的依赖中已经包含该版本的 nccl。如果必须使用低版本 torch，请手动升级 nccl 版本 >= 2.27.3。
 
 ## Installation
 
