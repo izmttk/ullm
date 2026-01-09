@@ -23,6 +23,7 @@ dependencies = [
     "pyzmq>=25.0.0",
     "msgspec",
     "cloudpickle",
+    "tqdm",
 ]
 
 [project.urls]

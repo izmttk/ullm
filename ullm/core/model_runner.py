@@ -2,6 +2,7 @@ import gc
 import os
 
 import torch
+import tqdm
 from transformers import PretrainedConfig
 
 from ..config import EngineConfig
@@ -13,7 +14,7 @@ from ..logger import init_logger
 from ..model_loader import load_model
 from ..models.registry import MODEL_REGISTRY
 from .common import ForwardBatch, ForwardMode
-from .cuda_graph import CUDAGraph
+from .cuda_graph import CUDAGraphManager
 from .kv_cache import KVCachePool
 
 logger = init_logger(__name__)
@@ -97,7 +98,7 @@ class ModelRunner:
         # Initialize KV Cache
         kv_cache_size = self.profile_kv_cache_size(gpu_memory_utilization)
         if self.rank == 0:
-            logger.info(f"Max num tokens in kv cache: {kv_cache_size}")
+            logger.info_once(f"Max num tokens in kv cache: {kv_cache_size}")
         self.kv_cache_size = kv_cache_size
         self.kv_cache = KVCachePool(
             dtype=self.dtype,
@@ -122,7 +123,7 @@ class ModelRunner:
 
         # Initialize CUDA Graph
         if not self.enforce_eager:
-            self.cuda_graph = CUDAGraph()
+            self.cuda_graph = CUDAGraphManager()
             self.capture_graph()
         else:
             self.cuda_graph = None
@@ -272,11 +273,7 @@ class ModelRunner:
                 return IntermediateTensors()
 
         # Forward pass
-        if (
-            self.cuda_graph is not None
-            and self.cuda_graph.is_captured
-            and batch.forward_mode == ForwardMode.DECODE
-        ):
+        if self.cuda_graph is not None and batch.forward_mode == ForwardMode.DECODE:
             hidden_states = self._execute_model_cuda_graph(batch, intermediate_tensors)
         else:
             hidden_states = self._execute_model_eager(batch, intermediate_tensors)
@@ -303,38 +300,50 @@ class ModelRunner:
         assert self.cuda_graph is not None
 
         bs = batch.num_seqs  # Only for decoding now
-        padded_bs = self.cuda_graph.match_bs(bs)
+        padded_bs, graph_runner = self.cuda_graph.get_graph_runner(bs)
 
         input_ids, positions = self.prepare_input(batch)
 
-        input_idx_buffer = self.cuda_graph.get_input_buffer("input_ids")
-        positions_buffer = self.cuda_graph.get_input_buffer("positions")
+        padded_input_ids = self.input_ids[:padded_bs]
+        padded_positions = self.positions[:padded_bs]
 
-        input_idx_buffer[:bs] = input_ids
-        positions_buffer[:bs] = positions
+        padded_input_ids.zero_()
+        padded_positions.zero_()
 
-        if intermediate_tensors is not None:
-            for name, tensor in intermediate_tensors.items():
-                buffer = self.cuda_graph.get_input_buffer(name)
-                buffer[:bs] = tensor
+        padded_input_ids[:bs] = input_ids
+        padded_positions[:bs] = positions
+
+        padded_intermediate_tensors = None
+        if self.intermediate_tensors is not None:
+            assert intermediate_tensors is not None
+            padded_intermediate_tensors = IntermediateTensors()
+            for name in self.intermediate_tensors.keys():
+                tensor = intermediate_tensors[name]
+                buffer = self.intermediate_tensors[name]
+                padded_buffer = buffer[:padded_bs]
+                padded_buffer.zero_()
+                padded_buffer[:bs] = tensor
+                padded_intermediate_tensors[name] = padded_buffer
 
         attention_metadata = self.attn_backend.build_metadata_for_cuda_graph_replay(
-            graph=self.cuda_graph,
             batch=batch,
             padded_bs=padded_bs,
         )
 
-        with attention_kv_cache(self.model, attention_metadata):
-            self.cuda_graph.replay(bs=padded_bs)
+        padded_hidden_states = graph_runner.replay(
+            args=(padded_input_ids, padded_positions, padded_intermediate_tensors),
+            context=attention_metadata,
+        )
 
         if get_pp_group().is_last_rank:
-            hidden_states_buffer = self.cuda_graph.get_output_buffer("hidden_states")
-            hidden_states = hidden_states_buffer[:bs]
+            assert isinstance(padded_hidden_states, torch.Tensor)
+            hidden_states = padded_hidden_states[:bs]
             return hidden_states
         else:
+            assert isinstance(padded_hidden_states, IntermediateTensors)
             intermediate_tensors = IntermediateTensors()
-            for name, buffer in self.cuda_graph.output_buffers.items():
-                intermediate_tensors[name] = buffer[:bs]
+            for name, tensor in padded_hidden_states.items():
+                intermediate_tensors[name] = tensor[:bs]
             return intermediate_tensors
 
     def _execute_model_eager(
@@ -355,89 +364,81 @@ class ModelRunner:
         graph_bs = [1, 2, 4, 8] + list(range(16, self.max_bs, 16))
         if self.max_bs not in graph_bs:
             graph_bs.append(self.max_bs)
-        logger.info(f"Capturing CUDA graphs for batch sizes:0 {graph_bs}")
+        logger.info_once(f"Capturing CUDA graphs for batch sizes: {graph_bs}")
 
-        self.attn_backend.prepare_for_cuda_graph_capture(
-            graph=self.cuda_graph,
+        self.attn_backend.prepare_for_cuda_graph_io_buffers(
             max_bs=self.max_bs,
             context_len=self.context_len,
         )
 
-        input_ids = torch.zeros((self.max_bs,), dtype=torch.long, device=self.device)
-        positions = torch.zeros((self.max_bs,), dtype=torch.long, device=self.device)
+        self.input_ids = torch.zeros(
+            (self.max_bs,), dtype=torch.long, device=self.device
+        )
+        self.positions = torch.zeros(
+            (self.max_bs,), dtype=torch.long, device=self.device
+        )
         if get_pp_group().is_first_rank:
-            intermediate_tensors = None
+            self.intermediate_tensors = None
         else:
-            intermediate_tensors = self.model.make_empty_intermediate_tensors(
+            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                 batch_size=self.max_bs,
                 dtype=self.dtype,
                 device=self.device,
             )
         if get_pp_group().is_last_rank:
-            hidden_states = torch.zeros(
+            self.hidden_states = torch.zeros(
                 (self.max_bs, self.hf_config.hidden_size),
                 dtype=self.dtype,
                 device=self.device,
             )
         else:
-            hidden_states = self.model.make_empty_intermediate_tensors(
+            self.hidden_states = self.model.make_empty_intermediate_tensors(
                 batch_size=self.max_bs,
                 dtype=self.dtype,
                 device=self.device,
             )
 
-        # Set input buffers
-        self.cuda_graph.set_input_buffer("input_ids", input_ids)
-        self.cuda_graph.set_input_buffer("positions", positions)
-
-        if intermediate_tensors is not None:
-            for name, tesor in intermediate_tensors.items():
-                self.cuda_graph.set_input_buffer(name, tesor)
-
-        # Set output buffers
-        if isinstance(hidden_states, torch.Tensor):
-            self.cuda_graph.set_output_buffer("hidden_states", hidden_states)
-        else:
-            for name, tesor in hidden_states.items():
-                self.cuda_graph.set_output_buffer(name, tesor)
-
         compiled_model = torch.compile(self.model, mode="max-autotune-no-cudagraphs")
 
         # Capture graphs for different batch sizes
-        for bs in reversed(graph_bs):
+        progress_bar = tqdm.tqdm(
+            graph_bs, desc="Capturing CUDA Graphs", disable=(self.rank != 0)
+        )
+        for bs in progress_bar:
             attention_metadata = (
                 self.attn_backend.build_metadata_for_cuda_graph_capture(
-                    graph=self.cuda_graph,
                     bs=bs,
                     context_len=self.context_len,
                 )
             )
 
             # prepare sliced inputs
-            bs_input_ids = input_ids[:bs]
-            bs_positions = positions[:bs]
+            bs_input_ids = self.input_ids[:bs]
+            bs_positions = self.positions[:bs]
             bs_intermediate_tensors = (
                 IntermediateTensors(
-                    {name: tensor[:bs] for name, tensor in intermediate_tensors.items()}
+                    {
+                        name: tensor[:bs]
+                        for name, tensor in self.intermediate_tensors.items()
+                    }
                 )
-                if intermediate_tensors is not None
+                if self.intermediate_tensors is not None
                 else None
             )
 
             with attention_kv_cache(self.model, attention_metadata):
-                # Warmup before capture
-                output = compiled_model(
-                    bs_input_ids, bs_positions, bs_intermediate_tensors
+                graph_runner = self.cuda_graph.create_graph_runner(bs)
+                outputs = graph_runner.capture(
+                    model=compiled_model,
+                    args=(bs_input_ids, bs_positions, bs_intermediate_tensors),
+                    context=attention_metadata,
                 )
-                with self.cuda_graph.capture(bs):
-                    output = compiled_model(
-                        bs_input_ids, bs_positions, bs_intermediate_tensors
-                    )
-                    if isinstance(hidden_states, torch.Tensor):
-                        hidden_states[:bs] = output
-                    else:
-                        for name, buffer in hidden_states.items():
-                            buffer[:bs] = output[name]
-            torch.cuda.synchronize()
+                if isinstance(self.hidden_states, torch.Tensor):
+                    assert isinstance(outputs, torch.Tensor)
+                    self.hidden_states[:bs] = outputs
+                else:
+                    assert isinstance(outputs, IntermediateTensors)
+                    for name, buffer in self.hidden_states.items():
+                        buffer[:bs] = outputs[name]
 
         torch.compiler.reset()

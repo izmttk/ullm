@@ -85,7 +85,7 @@ def warning_once(logger: logging.Logger, msg: str, *args) -> None:
     logger.warning(msg, *args, stacklevel=3)
 
 
-def init_logger(name: str) -> logging.Logger:
+def init_logger(name: str):
     logger = logging.getLogger(name)
 
     logger.handlers.clear()
