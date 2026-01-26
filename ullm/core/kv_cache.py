@@ -377,7 +377,7 @@ class KVCacheManager:
         # 于是最后radix tree中有[1,2,3,4] -> [10,11,12,13]和[1,2,3,5] -> [10,11,12,23]
         if new_prefix_len > old_prefix_len and old_prefix_len != 0:
             # 释放重复的kv cache slots
-            self.kv_cache_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
+            self.free_slots(kv_indices[old_prefix_len:new_prefix_len])
             # 更新sequence的kv_indices的重复部分
             kv_indices[old_prefix_len:new_prefix_len] = new_indices[
                 old_prefix_len:new_prefix_len
@@ -392,5 +392,7 @@ class KVCacheManager:
             self.radix_tree.dec_ref(new_last_node)
             if seq.seq_id in self.unfinished_sequences:
                 del self.unfinished_sequences[seq.seq_id]
+            # seq 中残存 new_kv_indices 需要释放，radix tree 不会缓存这部分
+            self.free_slots(seq.new_kv_indices.tolist())
             # kv indices 交给 radix tree 管理了，此后 seq 中的 kv_indices 可能不再有效
             seq.clear_kv_indices()

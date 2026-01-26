@@ -18,6 +18,8 @@ class EngineConfig:
     enforce_eager: bool = False
     context_len: int = 2048
 
+    disable_async_scheduling: bool = False
+
     log_level: str = "info"
     profile: bool = False
     profile_dir: str = "./profiles"
@@ -35,6 +37,9 @@ class EngineConfig:
                 return None
 
     def __post_init__(self):
+        self.disable_async_scheduling = (
+            self.pp_size > 1 or self.disable_async_scheduling
+        )
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.hf_generation_config = self.try_get_generation_config()
 
@@ -79,6 +84,7 @@ class EngineConfig:
             log_level=args.log_level,
             profile=args.profile,
             profile_dir=args.profile_dir,
+            disable_async_scheduling=args.disable_async_scheduling,
         )
 
 

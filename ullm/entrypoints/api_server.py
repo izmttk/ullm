@@ -176,6 +176,11 @@ if __name__ == "__main__":
         default="./profiles",
         help="Directory to save profiling results",
     )
+    parser.add_argument(
+        "--disable-async-scheduling",
+        action="store_true",
+        help="Disable asynchronous scheduling",
+    )
     args = parser.parse_args()
 
     run_server(args)

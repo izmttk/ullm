@@ -76,10 +76,11 @@ class Sequence:
     """
     token_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int32))
     num_prompt_tokens: int = 0
+    num_placeholder_tokens: int = 0  # for async scheduling
 
     @property
     def num_tokens(self) -> int:
-        return len(self.token_ids)
+        return len(self.token_ids) + self.num_placeholder_tokens
 
     @property
     def prompt_token_ids(self) -> np.ndarray:
@@ -143,9 +144,11 @@ class Sequence:
         assert len(cached_kv_indices) <= self.num_tokens
         self.cached_kv_indices = np.array(cached_kv_indices, dtype=np.int32)
 
-    def set_new_kv_indices(self, new_kv_indices: list[int]):
-        assert len(new_kv_indices) == self.num_tokens - self.num_cached_kv_indices
-        self.new_kv_indices = np.array(new_kv_indices, dtype=np.int32)
+    def append_new_kv_indices(self, new_kv_indices: list[int]):
+        assert len(new_kv_indices) == self.num_tokens - self.num_kv_indices
+        self.new_kv_indices = np.concatenate(
+            (self.new_kv_indices, np.array(new_kv_indices, dtype=np.int32))
+        )
 
     def cache_new_kv_indices(self):
         self.cached_kv_indices = np.concatenate(
@@ -153,14 +156,27 @@ class Sequence:
         )
         self.new_kv_indices = np.array([], dtype=np.int32)
 
+    def clear_kv_indices(self):
+        self.cached_kv_indices = np.array([], dtype=np.int32)
+        self.new_kv_indices = np.array([], dtype=np.int32)
+
     def append_new_tokens(self, new_token_ids: list[int]):
         self.token_ids = np.concatenate(
             (self.token_ids, np.array(new_token_ids, dtype=np.int32))
         )
 
-    def clear_kv_indices(self):
-        self.cached_kv_indices = np.array([], dtype=np.int32)
-        self.new_kv_indices = np.array([], dtype=np.int32)
+    def append_placeholder_tokens(self, num_placeholder: int):
+        self.num_placeholder_tokens += num_placeholder
+
+    def clear_placeholder_tokens(self):
+        self.num_placeholder_tokens = 0
+
+    def replace_placeholder_tokens(self, new_token_ids: list[int]):
+        assert len(new_token_ids) <= self.num_placeholder_tokens
+        self.token_ids = np.concatenate(
+            (self.token_ids, np.array(new_token_ids, dtype=np.int32))
+        )
+        self.num_placeholder_tokens -= len(new_token_ids)
 
 
 class ForwardMode(enum.Enum):
@@ -218,16 +234,21 @@ class ScheduledCachedSequence:
         return ScheduledCachedSequence(
             seq_id=seq.seq_id,
             sampling_params=seq.sampling_params,
-            new_token_ids=seq.token_ids[seq.num_cached_kv_indices :],
-            new_kv_indices=seq.new_kv_indices,
+            new_token_ids=np.array([], dtype=np.int32)
+            if seq.num_placeholder_tokens > 0
+            else seq.token_ids[-1:],
+            new_kv_indices=seq.new_kv_indices[-1:],
         )
 
     def apply_updates(self, seq: Sequence):
         assert seq.seq_id == self.seq_id
         seq.sampling_params = self.sampling_params
-        seq.cache_new_kv_indices()
-        seq.append_new_tokens(self.new_token_ids.tolist())
-        seq.set_new_kv_indices(self.new_kv_indices.tolist())
+        if seq.num_new_kv_indices > 0:
+            seq.cache_new_kv_indices()
+        if len(self.new_token_ids) > 0:
+            seq.append_new_tokens(self.new_token_ids.tolist())
+        if len(self.new_kv_indices) > 0:
+            seq.append_new_kv_indices(self.new_kv_indices.tolist())
 
 
 @dataclass

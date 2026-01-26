@@ -18,6 +18,7 @@ A lightweight vLLM-like LLM inference engine with radix-tree based KV cache, and
 - CUDA Graph 支持（仅 Decoding 阶段）
 - 增量调度和有状态的 Worker
 - Torch Profiler 支持
+- 异步调度（Async Scheduling）
 
 ## Requirements
 
@@ -82,6 +83,8 @@ options:
   --profile             Enable profiling support
   --profile-dir PROFILE_DIR
                         Directory to save profiling results
+  --disable-async-scheduling
+                        Disable asynchronous scheduling
 ```
 
 Offline Inference
@@ -143,8 +146,8 @@ Results:
 - [x] More Configurable Options
 - [x] Profiling
 - [x] Increamental Batch Scheduling and Stateful Workers
+- [x] Async Scheduling (Overlap Scheduling/Zero-Overhead Scheduling)
 - [ ] Further Improvements based on Profiling
-- [ ] Overlap Scheduling
 - [ ] Benchmark Metrics on API Server
 
 Further development is still ongoing.

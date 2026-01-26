@@ -105,7 +105,7 @@ class Worker:
     def initialize(self, gpu_memory_utilization: float):
         self.model_runner.initialize(gpu_memory_utilization)
 
-    def apply_sequence_updates(self, sched_output: SchedulerOutput) -> ForwardBatch:
+    def update_sequence_states(self, sched_output: SchedulerOutput) -> ForwardBatch:
         for finished_seq_id in sched_output.finished_seq_ids:
             if finished_seq_id in self.sequences:
                 del self.sequences[finished_seq_id]
@@ -140,10 +140,20 @@ class Worker:
                 seqs=decode_batch,
             )
 
+    def post_update_from_output(self, batch: ForwardBatch, input_ids: list[int]):
+        # 默认情况下，scheduler 的增量更新是延迟的，即在下一次调度时才更新 Worker 中的 sequence 状态。
+        # 但是当开启了异步调度时，一个 seq 的某些状态需要在 forward 后立即更新，即生成的新 token id。
+        # 这样每一次 forward 后，Worker 上的 sequence 状态都是最新的，下一次调度只需要 scheduler 提供一个新的 kv 索引即可。
+        if self.config.disable_async_scheduling:
+            return
+        for seq, new_token_id in zip(batch.seqs, input_ids):
+            # 在 worker 上即时更新 sequence 状态，因此不需要维护 num_placeholder_tokens 状态
+            seq.append_new_tokens([new_token_id])
+            seq.cache_new_kv_indices()
+
     def execute_model(self, sched_output: SchedulerOutput) -> list[int] | None:
         intermediate_tensors = None
-        batch = self.apply_sequence_updates(sched_output)
-
+        batch = self.update_sequence_states(sched_output)
         if hasattr(self, "profiler") and self.profiler_started:
             self.profiler.step()
 
@@ -162,7 +172,10 @@ class Worker:
             return None
 
         assert isinstance(output, torch.Tensor)
-        return output.tolist()
+
+        output_ids = output.tolist()
+        self.post_update_from_output(batch, output_ids)
+        return output_ids
 
     def get_kv_cache_size(self) -> int:
         assert hasattr(self.model_runner, "kv_cache_size"), (

@@ -126,6 +126,6 @@ flowchart TB
     B@{ shape: rounded}
 ```
 
-## Overlap Scheduling
+## Async Scheduling
 
 WIP

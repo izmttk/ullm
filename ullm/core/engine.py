@@ -42,11 +42,14 @@ class Engine:
             kv_cache_size=kv_cache_size,
         )
 
-        self.pp_queue: queue.Queue[tuple[Future[list[int]], SchedulerOutput]] | None = (
-            None
-        )
-        if self.config.pp_size > 1:
-            self.pp_queue = queue.Queue(self.config.pp_size)
+        self.batch_queue: (
+            queue.Queue[tuple[Future[list[int]], SchedulerOutput]] | None
+        ) = None
+        if self.config.pp_size > 1 or not self.config.disable_async_scheduling:
+            max_concurrency_batches = (
+                self.config.pp_size if self.config.pp_size > 1 else 2
+            )
+            self.batch_queue = queue.Queue(max_concurrency_batches)
 
         if config.profile:
             profile_dir = Path(config.profile_dir)
@@ -103,9 +106,9 @@ class Engine:
         3. Executes the model.
         5. Updates the sequences.
         """
-        if self.pp_queue is not None:
+        if self.batch_queue is not None:
             # 注意当开启了流水线并行时，step 可能会返回空列表
-            return self.step_with_pp()
+            return self.step_with_batch_queue()
 
         sched_output = self.scheduler.schedule()
         if not sched_output:
@@ -115,18 +118,18 @@ class Engine:
         outputs = self.update_from_output(sched_output, output_ids)
         return outputs
 
-    def step_with_pp(self) -> list[EngineStepResult]:
-        assert self.pp_queue is not None
+    def step_with_batch_queue(self) -> list[EngineStepResult]:
+        assert self.batch_queue is not None
         outputs: list[EngineStepResult] = []
         sched_output = None
-        if not self.pp_queue.full():
+        if not self.batch_queue.full():
             sched_output = self.scheduler.schedule()
             if sched_output:
                 fut = self.model_executor.execute_model(sched_output)
-                self.pp_queue.put_nowait((fut, sched_output))
+                self.batch_queue.put_nowait((fut, sched_output))
         # 如果 batch 为 None，说明要么没有新请求，要么 pp 队列已满不允许调度
-        if sched_output is None and not self.pp_queue.empty():
-            (fut, sched_batch) = self.pp_queue.get_nowait()
+        if sched_output is None and not self.batch_queue.empty():
+            (fut, sched_batch) = self.batch_queue.get_nowait()
             output_ids = fut.result()  # 阻塞等待结果
             outputs = self.update_from_output(sched_batch, output_ids)
 
@@ -180,7 +183,8 @@ class Engine:
         # Check for max tokens
         if (
             seq.sampling_params.max_tokens
-            and seq.num_tokens >= seq.sampling_params.max_tokens
+            and seq.num_tokens - seq.num_placeholder_tokens
+            >= seq.sampling_params.max_tokens
         ):
             return True, FinishReason.LENGTH
         if (
@@ -190,7 +194,7 @@ class Engine:
             return True, FinishReason.LENGTH
 
         # Check for context length
-        if seq.num_tokens >= self.config.context_len:
+        if seq.num_tokens - seq.num_placeholder_tokens >= self.config.context_len:
             return True, FinishReason.LENGTH
 
         return False, None
