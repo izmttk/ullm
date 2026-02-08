@@ -40,11 +40,11 @@ class CUDAGraphRunner:
             if src.data_ptr() != dst.data_ptr():
                 dst.copy_(src)
 
-    def capture(self, model: Callable, args=(), kwargs={}, context=None):
+    def capture(self, model: Callable, *args, **kwargs):
         self.graph = torch.cuda.CUDAGraph()
         self.mempool = self.graph.pool() if self.mempool is None else self.mempool
 
-        self.input_tensors = self.get_tensors(args, kwargs, context)
+        self.input_tensors = self.get_tensors(*args, **kwargs)
 
         # warm up
         for _ in range(self.num_warmup):
@@ -58,9 +58,9 @@ class CUDAGraphRunner:
         self.output_tensors = self.get_tensors(outputs)
         return outputs
 
-    def replay(self, args=(), kwargs={}, context=None):
+    def replay(self, *args, **kwargs):
         assert self.graph is not None, "CUDAGraph has not been captured yet."
-        self.apply_input_tensors(args, kwargs, context)
+        self.apply_input_tensors(*args, **kwargs)
         self.graph.replay()
         return self.outputs
 

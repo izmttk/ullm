@@ -331,8 +331,7 @@ class ModelRunner:
         )
 
         padded_hidden_states = graph_runner.replay(
-            args=(padded_input_ids, padded_positions, padded_intermediate_tensors),
-            context=attention_metadata,
+            padded_input_ids, padded_positions, padded_intermediate_tensors
         )
 
         if get_pp_group().is_last_rank:
@@ -406,10 +405,7 @@ class ModelRunner:
         )
         for bs in progress_bar:
             attention_metadata = (
-                self.attn_backend.build_metadata_for_cuda_graph_capture(
-                    bs=bs,
-                    context_len=self.context_len,
-                )
+                self.attn_backend.build_metadata_for_cuda_graph_capture(bs=bs)
             )
 
             # prepare sliced inputs
@@ -429,9 +425,7 @@ class ModelRunner:
             with attention_kv_cache(self.model, attention_metadata):
                 graph_runner = self.cuda_graph.create_graph_runner(bs)
                 outputs = graph_runner.capture(
-                    model=compiled_model,
-                    args=(bs_input_ids, bs_positions, bs_intermediate_tensors),
-                    context=attention_metadata,
+                    compiled_model, bs_input_ids, bs_positions, bs_intermediate_tensors
                 )
                 if isinstance(self.hidden_states, torch.Tensor):
                     assert isinstance(outputs, torch.Tensor)
