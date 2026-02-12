@@ -1,6 +1,14 @@
-# $\mathrm{\mu LLM}$ (micro-LLM)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+    <img alt="vLLM" src="docs/assets/logo-light.png" width="400">
+  </picture>
+</p>
+<p align="center">
+μLLM: A lightweight vLLM-like LLM inference engine with radix-tree based KV cache, and more.
+</p>
 
-A lightweight vLLM-like LLM inference engine with radix-tree based KV cache, and more.
+---
 
 该项目受 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm/tree/main) 启发，提供一个从零开始构建的 LLM 推理框架
 
