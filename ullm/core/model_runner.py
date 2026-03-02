@@ -7,7 +7,7 @@ from transformers import PretrainedConfig
 
 from ..config import EngineConfig
 from ..distributed import all_gather, get_pp_group, get_pp_indices, get_tp_group
-from ..layers.attention import AttentionBackend, attention_kv_cache
+from ..layers.attention import AttentionBackend, attention_context
 from ..layers.sampler import Sampler
 from ..layers.utils import IntermediateTensors
 from ..logger import init_logger
@@ -352,7 +352,7 @@ class ModelRunner:
 
         attention_metadata = self.attn_backend.build_metadata(batch=batch)
 
-        with attention_kv_cache(self.model, attention_metadata):
+        with attention_context(attention_metadata):
             hidden_states = self.model(input_ids, positions, intermediate_tensors)
 
         return hidden_states
@@ -422,7 +422,7 @@ class ModelRunner:
                 else None
             )
 
-            with attention_kv_cache(self.model, attention_metadata):
+            with attention_context(attention_metadata):
                 graph_runner = self.cuda_graph.create_graph_runner(bs)
                 outputs = graph_runner.capture(
                     compiled_model, bs_input_ids, bs_positions, bs_intermediate_tensors

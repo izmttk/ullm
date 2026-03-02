@@ -304,16 +304,16 @@ class AttentionBackend:
         )
 
 
+@dataclass
+class AttentionContext:
+    attention_metadata: AttentionMetadata | None = None
+_attention_context = AttentionContext()
+    
 @contextmanager
-def attention_kv_cache(model: nn.Module, metadata: AttentionMetadata):
-    attn_modules: list[Attention] = []
-    for module in model.modules():
-        if isinstance(module, Attention):
-            attn_modules.append(module)
-            module.set_attention_metadata(metadata)
+def attention_context(attention_metadata: AttentionMetadata):
+    _attention_context.attention_metadata = attention_metadata
     yield
-    for module in attn_modules:
-        module.set_attention_metadata(None)
+    _attention_context.attention_metadata = None
 
 
 # flashinfer implemented attention
@@ -335,24 +335,22 @@ class Attention(nn.Module):
         self.scaling = self.head_dim**-0.5 if scaling is None else scaling
         self.layer_id = layer_id
 
-        self.attention_metadata: AttentionMetadata | None = None
-
-    def set_attention_metadata(self, metadata: AttentionMetadata | None):
-        self.attention_metadata = metadata
+        self.attention_context = _attention_context
 
     @torch.compiler.disable
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, save_kv_cache=True
     ):
-        assert self.attention_metadata is not None
+        attention_metadata = self.attention_context.attention_metadata
+        assert attention_metadata is not None
 
-        cache_loc = self.attention_metadata.output_kv_indices
+        cache_loc = attention_metadata.output_kv_indices
         q = q.contiguous()
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.attention_metadata.kv_cache.set_kv_cache(
+                attention_metadata.kv_cache.set_kv_cache(
                     self.layer_id,
                     cache_loc,
                     k.view(-1, self.num_kv_heads, self.head_dim),
@@ -360,17 +358,17 @@ class Attention(nn.Module):
                 )
 
         q = q.view(-1, self.num_heads, self.head_dim)
-        k_cache, v_cache = self.attention_metadata.kv_cache.get_kv_cache(self.layer_id)
+        k_cache, v_cache = attention_metadata.kv_cache.get_kv_cache(self.layer_id)
         k_cache = k_cache.view(-1, 1, self.num_kv_heads, self.head_dim)
         v_cache = v_cache.view(-1, 1, self.num_kv_heads, self.head_dim)
 
         # Call the wrapped function
-        if self.attention_metadata.forward_mode == ForwardMode.PREFILL:
-            self.attention_metadata.wrapper._sm_scale = self.scaling
-            o = self.attention_metadata.wrapper.run(q, (k_cache, v_cache))
-        elif self.attention_metadata.forward_mode == ForwardMode.DECODE:
-            self.attention_metadata.wrapper._sm_scale = self.scaling
-            o = self.attention_metadata.wrapper.run(q, (k_cache, v_cache))
+        if attention_metadata.forward_mode == ForwardMode.PREFILL:
+            attention_metadata.wrapper._sm_scale = self.scaling
+            o = attention_metadata.wrapper.run(q, (k_cache, v_cache))
+        elif attention_metadata.forward_mode == ForwardMode.DECODE:
+            attention_metadata.wrapper._sm_scale = self.scaling
+            o = attention_metadata.wrapper.run(q, (k_cache, v_cache))
         else:
             raise NotImplementedError
 
