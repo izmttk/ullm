@@ -12,11 +12,12 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
-from typing import Callable
+from typing import Any, Callable
 
 import msgspec
 import zmq
 
+from ullm.core.model_runner import ModelOutput
 from ullm.serial import MsgpackDecoder, MsgpackEncoder
 
 from ..config import EngineConfig
@@ -121,22 +122,39 @@ def handle_rpc_request(worker: Worker, req: RpcRequest):
     try:
         if isinstance(req, RpcRequestExecuteModel):
             result = worker.execute_model(req.sched_output)
-            return RpcResponseExecuteModel(
-                request_id=req.request_id,
-                result=result,
-            )
+            return result
         elif isinstance(req, RpcRequestInitialize):
             worker.initialize(req.gpu_memory_utilization)
-            return RpcResponseNone(request_id=req.request_id)
         elif isinstance(req, RpcRequestGetKVCacheSize):
             result = worker.get_kv_cache_size()
+            return result
+        elif isinstance(req, RpcRequestProfile):
+            worker.profile(req.action)
+        else:
+            raise ValueError(f"Unknown method: {req.method_name}")
+    except Exception as e:
+        return e
+
+def handle_rpc_response(req: RpcRequest, result: Any) -> RpcResponse:
+    try:
+        if isinstance(req, RpcRequestExecuteModel):
+            assert isinstance(result, ModelOutput | None)
+            return RpcResponseExecuteModel(
+                request_id=req.request_id,
+                result=result.get_output().tolist() if result is not None else None,
+            )
+        elif isinstance(req, RpcRequestInitialize):
+            return RpcResponseNone(request_id=req.request_id)
+        elif isinstance(req, RpcRequestGetKVCacheSize):
+            assert isinstance(result, int)
             return RpcResponseGetKVCacheSize(
                 request_id=req.request_id,
                 result=result,
             )
         elif isinstance(req, RpcRequestProfile):
-            worker.profile(req.action)
             return RpcResponseNone(request_id=req.request_id)
+        elif isinstance(result, Exception):
+            raise result
         else:
             raise ValueError(f"Unknown method: {req.method_name}")
     except Exception as e:
@@ -181,7 +199,7 @@ def run_worker_loop(
         decoder = MsgpackDecoder(RpcRequest)
 
         input_queue: queue.Queue[RpcRequest] = queue.Queue()
-        output_queue: queue.Queue[RpcResponse] | None = None
+        output_queue: queue.Queue[tuple[RpcRequest, Any]] | None = None
 
         def process_input_socket():
             input_socket = ctx.socket(zmq.SUB)
@@ -203,8 +221,9 @@ def run_worker_loop(
                 output_socket = ctx.socket(zmq.PUSH)
                 output_socket.connect(response_path)
                 while True:
-                    outputs = output_queue.get()
-                    frames = encoder.encode(outputs)
+                    req, result = output_queue.get()
+                    msg = handle_rpc_response(req, result)
+                    frames = encoder.encode(msg)
                     output_socket.send_multipart(frames, copy=False)
 
             output_thread = threading.Thread(target=process_output_socket, daemon=True)
@@ -216,9 +235,9 @@ def run_worker_loop(
         report_pipe.send(WorkerEvent(rank=rank, type=WorkerEventType.READY))
         while True:
             req = input_queue.get()  # 等待输入
-            resp = handle_rpc_request(worker, req)  # 处理请求
+            result = handle_rpc_request(worker, req)  # 处理请求
             if output_queue is not None:
-                output_queue.put_nowait(resp)  # 发送响应
+                output_queue.put_nowait((req, result))  # 发送响应
     except SystemExit:
         logger.debug("Keyboard interrupt received, shutting down worker process.")
     except Exception:

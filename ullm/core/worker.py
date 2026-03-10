@@ -17,7 +17,7 @@ from ..distributed import (
 from ..layers.utils import IntermediateTensors
 from ..logger import init_logger
 from .common import ForwardBatch, ForwardMode, SchedulerOutput, Sequence
-from .model_runner import ModelRunner
+from .model_runner import ModelOutput, ModelRunner
 
 logger = init_logger(__name__)
 
@@ -151,7 +151,7 @@ class Worker:
             seq.append_new_tokens([new_token_id])
             seq.cache_new_kv_indices()
 
-    def execute_model(self, sched_output: SchedulerOutput) -> list[int] | None:
+    def execute_model(self, sched_output: SchedulerOutput) -> ModelOutput | None:
         intermediate_tensors = None
         batch = self.update_sequence_states(sched_output)
         if hasattr(self, "profiler") and self.profiler_started:
@@ -171,11 +171,13 @@ class Worker:
             )
             return None
 
-        assert isinstance(output, torch.Tensor)
+        assert isinstance(output, ModelOutput)
+        self.post_update_from_output(batch, output.get_output().tolist())
+        return output
 
-        output_ids = output.tolist()
-        self.post_update_from_output(batch, output_ids)
-        return output_ids
+        # output_ids = output.get_output().tolist()
+        # self.post_update_from_output(batch, output_ids)
+        # return output_ids
 
     def get_kv_cache_size(self) -> int:
         assert hasattr(self.model_runner, "kv_cache_size"), (

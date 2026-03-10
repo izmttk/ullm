@@ -1,11 +1,13 @@
 import gc
 import os
+from dataclasses import dataclass
 
 import torch
 import tqdm
 from transformers import PretrainedConfig
 
 from ..config import EngineConfig
+from ..core.input_batch import InputBatch
 from ..distributed import all_gather, get_pp_group, get_pp_indices, get_tp_group
 from ..layers.attention import AttentionBackend, attention_context
 from ..layers.sampler import Sampler
@@ -71,6 +73,17 @@ def get_model_config_per_gpu(
     )
 
 
+@dataclass
+class ModelOutput:
+    output: torch.Tensor
+    copy_ready_event: torch.cuda.Event | None = None
+
+    def get_output(self):
+        if self.copy_ready_event is not None:
+            self.copy_ready_event.synchronize()
+        return self.output
+
+
 class ModelRunner:
     def __init__(
         self,
@@ -120,6 +133,21 @@ class ModelRunner:
             dtype=self.dtype,
             device=self.device,
         )
+
+        # Initialize input batch buffer
+        self.input_batch = InputBatch(
+            max_bs=self.max_bs,
+            context_len=self.context_len,
+            vocab_size=self.hf_config.vocab_size,
+            device=self.device,
+        )
+        self.intermediate_tensors: IntermediateTensors | None = None
+        if not get_pp_group().is_last_rank:
+            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                batch_size=self.max_bs,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
         # Initialize CUDA Graph
         if not self.enforce_eager:
@@ -200,63 +228,26 @@ class ModelRunner:
         torch.cuda.empty_cache()
         return max_num_tokens
 
-    def prepare_input(self, batch: ForwardBatch):
-        input_ids: list[int] = []
-        positions: list[int] = []
-
-        for seq in batch.seqs:
-            input_ids.extend(seq.token_ids[seq.num_cached_kv_indices :])
-            positions.extend(range(seq.num_cached_kv_indices, seq.num_tokens))
-
-        tensor_input_ids = torch.tensor(input_ids, device=self.device)
-        tensor_positions = torch.tensor(positions, device=self.device)
-
-        return (
-            tensor_input_ids,
-            tensor_positions,
-        )
-
-    def prepare_sampling_params(self, batch: ForwardBatch):
-        vocab_size = self.hf_config.vocab_size
-
-        temperatures = []
-        min_ps = []
-        top_ps = []
-        top_ks = []
-        for seq in batch.seqs:
-            temperatures.append(seq.sampling_params.temperature)
-            min_ps.append(seq.sampling_params.min_p)
-            top_ps.append(seq.sampling_params.top_p)
-            top_k = seq.sampling_params.top_k
-            if top_k == -1:
-                top_k = vocab_size
-            else:
-                top_k = min(top_k, vocab_size)
-            top_ks.append(top_k)
-
-        tensor_temperatures = torch.tensor(
-            temperatures, dtype=torch.float, device=self.device
-        )
-        tensor_min_ps = torch.tensor(min_ps, dtype=torch.float, device=self.device)
-        tensor_top_ps = torch.tensor(top_ps, dtype=torch.float, device=self.device)
-        tensor_top_ks = torch.tensor(top_ks, dtype=torch.long, device=self.device)
-
-        return (tensor_temperatures, tensor_min_ps, tensor_top_ps, tensor_top_ks)
-
-    def prepare_last_hidden_states(
-        self, batch: ForwardBatch, hidden_states: torch.Tensor
+    def prepare_input(
+        self,
+        batch: ForwardBatch,
+        intermediate_tensors: IntermediateTensors | None = None,
     ):
-        last_indices = []
-        cu_seq_len = 0
-        for seq in batch.seqs:
-            cu_seq_len += seq.num_tokens - seq.num_cached_kv_indices
-            last_indices.append(cu_seq_len - 1)
-        return hidden_states[..., last_indices, :]
+        self.input_batch.apply_batch(batch)
+        if self.intermediate_tensors is not None:
+            assert intermediate_tensors is not None
+            for name in self.intermediate_tensors.keys():
+                tensor = intermediate_tensors[name]
+                buffer = self.intermediate_tensors[name]
+                buffer.zero_()
+                buffer[: self.input_batch.num_new_tokens] = tensor
 
     @torch.inference_mode()
     def execute_model(
-        self, batch: ForwardBatch, intermediate_tensors: IntermediateTensors | None
-    ) -> torch.Tensor | IntermediateTensors:
+        self,
+        batch: ForwardBatch,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelOutput | IntermediateTensors:
         assert hasattr(self, "model") and hasattr(self, "sampler"), (
             "Model and sampler must be loaded before execution."
         )
@@ -268,15 +259,16 @@ class ModelRunner:
 
         if batch.num_seqs == 0:
             if get_pp_group().is_last_rank:
-                return torch.empty((0,), device=self.device)
+                return ModelOutput(output=torch.empty((0,), device=self.device))
             else:
                 return IntermediateTensors()
+        self.prepare_input(batch, intermediate_tensors)
 
         # Forward pass
         if self.cuda_graph is not None and batch.forward_mode == ForwardMode.DECODE:
-            hidden_states = self._execute_model_cuda_graph(batch, intermediate_tensors)
+            hidden_states = self._execute_model_cuda_graph()
         else:
-            hidden_states = self._execute_model_eager(batch, intermediate_tensors)
+            hidden_states = self._execute_model_eager()
 
         if not get_pp_group().is_last_rank:
             assert isinstance(hidden_states, IntermediateTensors)
@@ -285,10 +277,19 @@ class ModelRunner:
 
         assert isinstance(hidden_states, torch.Tensor)
         # Compute logits
-        hidden_states = self.prepare_last_hidden_states(batch, hidden_states)
+        logits_indices = self.input_batch.logits_indices[: self.input_batch.bs]
+        hidden_states = hidden_states[logits_indices]
         logits = self.model.compute_logits(hidden_states)
 
         # Sampling
+        output_ids = self.sampler(
+            logits,
+            self.input_batch.temperatures[: self.input_batch.bs],
+            self.input_batch.min_ps[: self.input_batch.bs],
+            self.input_batch.top_ps[: self.input_batch.bs],
+            self.input_batch.top_ks[: self.input_batch.bs],
+        )
+
         (temperatures, min_ps, top_ps, top_ks) = self.prepare_sampling_params(batch)
         output_ids = self.sampler(logits, temperatures, min_ps, top_ps, top_ks)
 
@@ -299,34 +300,30 @@ class ModelRunner:
     ) -> torch.Tensor | IntermediateTensors:
         assert self.cuda_graph is not None
 
-        bs = batch.num_seqs  # Only for decoding now
+        return ModelOutput(output=output_ids)
+
+    def _execute_model_cuda_graph(self) -> torch.Tensor | IntermediateTensors:
+        assert self.cuda_graph is not None and hasattr(self, "intermediate_tensors"), (
+            "CUDA Graph not initialized."
+        )
+
+        bs = self.input_batch.bs  # Only for decoding now
         padded_bs, graph_runner = self.cuda_graph.get_graph_runner(bs)
 
-        input_ids, positions = self.prepare_input(batch)
+        assert bs == self.input_batch.num_new_tokens
 
-        padded_input_ids = self.input_ids[:padded_bs]
-        padded_positions = self.positions[:padded_bs]
-
-        padded_input_ids.zero_()
-        padded_positions.zero_()
-
-        padded_input_ids[:bs] = input_ids
-        padded_positions[:bs] = positions
+        padded_input_ids = self.input_batch.input_ids[:bs]
+        padded_positions = self.input_batch.positions[:bs]
 
         padded_intermediate_tensors = None
         if self.intermediate_tensors is not None:
-            assert intermediate_tensors is not None
             padded_intermediate_tensors = IntermediateTensors()
             for name in self.intermediate_tensors.keys():
-                tensor = intermediate_tensors[name]
-                buffer = self.intermediate_tensors[name]
-                padded_buffer = buffer[:padded_bs]
-                padded_buffer.zero_()
-                padded_buffer[:bs] = tensor
-                padded_intermediate_tensors[name] = padded_buffer
+                tensor = self.intermediate_tensors[name]
+                padded_intermediate_tensors[name] = tensor[:padded_bs]
 
         attention_metadata = self.attn_backend.build_metadata_for_cuda_graph_replay(
-            batch=batch,
+            batch=self.input_batch,
             padded_bs=padded_bs,
         )
 
@@ -345,12 +342,18 @@ class ModelRunner:
                 intermediate_tensors[name] = tensor[:bs]
             return intermediate_tensors
 
-    def _execute_model_eager(
-        self, batch: ForwardBatch, intermediate_tensors: IntermediateTensors | None
-    ) -> torch.Tensor | IntermediateTensors:
-        input_ids, positions = self.prepare_input(batch)
+    def _execute_model_eager(self) -> torch.Tensor | IntermediateTensors:
+        input_ids = self.input_batch.input_ids[: self.input_batch.num_new_tokens]
+        positions = self.input_batch.positions[: self.input_batch.num_new_tokens]
+        if self.intermediate_tensors is not None:
+            intermediate_tensors = IntermediateTensors()
+            for name in self.intermediate_tensors.keys():
+                tensor = self.intermediate_tensors[name]
+                intermediate_tensors[name] = tensor[: self.input_batch.num_new_tokens]
+        else:
+            intermediate_tensors = None
 
-        attention_metadata = self.attn_backend.build_metadata(batch=batch)
+        attention_metadata = self.attn_backend.build_metadata(batch=self.input_batch)
 
         with attention_context(attention_metadata):
             hidden_states = self.model(input_ids, positions, intermediate_tensors)
@@ -370,12 +373,6 @@ class ModelRunner:
             context_len=self.context_len,
         )
 
-        self.input_ids = torch.zeros(
-            (self.max_bs,), dtype=torch.long, device=self.device
-        )
-        self.positions = torch.zeros(
-            (self.max_bs,), dtype=torch.long, device=self.device
-        )
         if get_pp_group().is_first_rank:
             self.intermediate_tensors = None
         else:
@@ -409,8 +406,8 @@ class ModelRunner:
             )
 
             # prepare sliced inputs
-            bs_input_ids = self.input_ids[:bs]
-            bs_positions = self.positions[:bs]
+            bs_input_ids = self.input_batch.input_ids[:bs]
+            bs_positions = self.input_batch.positions[:bs]
             bs_intermediate_tensors = (
                 IntermediateTensors(
                     {

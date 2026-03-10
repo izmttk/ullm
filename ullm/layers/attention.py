@@ -8,7 +8,8 @@ from flashinfer import (
     BatchPrefillWithPagedKVCacheWrapper,
 )
 
-from ..core.common import ForwardBatch, ForwardMode
+from ..core.common import ForwardMode
+from ..core.input_batch import InputBatch
 from ..core.kv_cache import KVCachePool
 
 
@@ -60,59 +61,20 @@ class AttentionBackend:
 
     def build_metadata(
         self,
-        batch: ForwardBatch,
+        batch: InputBatch,
     ):
-        page_size = 1
-        seqlens_q = torch.tensor(
-            [seq.num_tokens - seq.num_cached_kv_indices for seq in batch.seqs],
-            dtype=torch.int32,
-            device="cpu",
-        )  # (max_bs,)
-        seqlens_kv = torch.tensor(
-            [seq.num_kv_indices for seq in batch.seqs], dtype=torch.int32, device="cpu"
-        )  # (max_bs,)
-
-        qo_indptr = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device="cpu"),
-                torch.cumsum(seqlens_q, dim=0, dtype=torch.int32),
-            ]
-        )  # (max_bs + 1,)
-
-        paged_seqlens_kv = (
-            seqlens_kv // page_size + (seqlens_kv % page_size != 0).int()
-        )  # (max_bs,)
-        paged_kv_indptr = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device="cpu"),
-                torch.cumsum(paged_seqlens_kv, dim=0, dtype=torch.int32),
-            ]
-        )  # (max_bs + 1,)
-        paged_kv_last_page_len = seqlens_kv % page_size
-        paged_kv_last_page_len = torch.where(
-            paged_kv_last_page_len == 0, page_size, paged_kv_last_page_len
-        )  # (max_bs,)
-
-        paged_kv_indices = []
-        for seq, seq_paged_len in zip(batch.seqs, paged_seqlens_kv):
-            seq_paged_len = int(seq_paged_len.item())
-            seq_paged_kv = torch.cat(
-                [
-                    torch.tensor(
-                        seq.kv_indices,
-                        dtype=torch.int32,
-                        device=self.device,
-                    ),
-                    torch.full(
-                        (seq_paged_len * page_size - seq.num_kv_indices,),
-                        -1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    ),
-                ]
-            )
-            paged_kv_indices.append(seq_paged_kv)
-        paged_kv_indices = torch.cat(paged_kv_indices, dim=0)  # (num_total_pages,)
+        qo_indptr = batch.cu_seqlen[: batch.bs + 1].to(
+            dtype=torch.int32, device="cpu"
+        )  # (bs + 1,)
+        paged_kv_indptr = batch.cu_kv_seqlen[: batch.bs + 1].to(
+            dtype=torch.int32, device="cpu"
+        )  # (bs + 1,)
+        paged_kv_last_page_len = torch.ones(
+            batch.bs, dtype=torch.int32, device="cpu"
+        )  # (bs,)
+        paged_kv_indices = batch.kv_indices[: batch.num_kv_indices].to(
+            dtype=torch.int32, device=self.device
+        )  # (num_kv_indices,)
 
         wrapper = None
         if batch.forward_mode == ForwardMode.PREFILL:
@@ -126,7 +88,7 @@ class AttentionBackend:
                 num_kv_heads=self.num_kv_heads,
                 head_dim_qk=self.head_dim,
                 head_dim_vo=self.head_dim,
-                page_size=page_size,
+                page_size=1,
                 causal=True,
                 q_data_type=self.dtype,
                 kv_data_type=self.dtype,
@@ -140,24 +102,13 @@ class AttentionBackend:
                 num_qo_heads=self.num_qo_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
-                page_size=page_size,
+                page_size=1,
                 q_data_type=self.dtype,
                 kv_data_type=self.dtype,
             )
 
-        output_kv_indices = torch.cat(
-            [
-                torch.tensor(
-                    seq.new_kv_indices,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                for seq in batch.seqs
-            ],
-            dim=0,
-        )
-
-        assert wrapper is not None
+        output_kv_indices = batch.output_kv_indices[: batch.num_new_kv_indices]
+        assert wrapper is not None and batch.forward_mode is not None
         return AttentionMetadata(
             forward_mode=batch.forward_mode,
             kv_cache=self.kv_cache,
@@ -187,23 +138,23 @@ class AttentionBackend:
 
     # build_metadata_for_cuda_graph_capture will create new decode_wrapper for each bs
     def build_metadata_for_cuda_graph_capture(self, bs: int):
-        paged_kv_indptr_buf = self.paged_kv_indptr_buffer[: bs + 1]
-        paged_kv_indices_buf = self.paged_kv_indices_buffer[: bs * self.context_len]
-        paged_kv_last_page_len_buf = self.paged_kv_last_page_len_buffer[:bs]
+        paged_kv_indptr_buffer = self.paged_kv_indptr_buffer[: bs + 1]
+        paged_kv_indices_buffer = self.paged_kv_indices_buffer[: bs * self.context_len]
+        paged_kv_last_page_len_buffer = self.paged_kv_last_page_len_buffer[:bs]
 
         decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self.workspace_buffer,
             "NHD",
             use_tensor_cores=False,
             use_cuda_graph=True,
-            paged_kv_indptr_buffer=paged_kv_indptr_buf,
-            paged_kv_indices_buffer=paged_kv_indices_buf,
-            paged_kv_last_page_len_buffer=paged_kv_last_page_len_buf,
+            paged_kv_indptr_buffer=paged_kv_indptr_buffer,
+            paged_kv_indices_buffer=paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer=paged_kv_last_page_len_buffer,
         )
 
         paged_kv_indptr = torch.arange(0, bs + 1, dtype=torch.int32, device="cpu")
         # paged_kv_indices is placed in cuda decive for reducing a h2d copy
-        paged_kv_indices = paged_kv_indices_buf
+        paged_kv_indices = paged_kv_indices_buffer
         paged_kv_last_page_len = torch.ones(bs, dtype=torch.int32, device="cpu")
         output_kv_indices = self.output_kv_indices_buffer[:bs]
 
@@ -231,33 +182,33 @@ class AttentionBackend:
     # build_metadata_for_cuda_graph_replay will reuse decode_wrapper created during capture
     def build_metadata_for_cuda_graph_replay(
         self,
-        batch: ForwardBatch,
+        batch: InputBatch,
         padded_bs: int,
     ):
         # replay mode, fill in actual sizes
-        bs = batch.num_seqs
+        bs = batch.bs
 
         # padding kv len will be set to 1
-        seqlens_kv = torch.tensor(
-            # use 1 as padded sequence kv len, because flashinfer requires last_page_len > 0
-            [seq.num_kv_indices for seq in batch.seqs] + [1] * (padded_bs - bs),
-            dtype=torch.int32,
-            device="cpu",
-        )  # (padded_bs,)
         paged_kv_indptr = torch.cat(
             [
-                torch.zeros(1, dtype=torch.int32, device="cpu"),
-                torch.cumsum(seqlens_kv, dim=0, dtype=torch.int32),
+                batch.cu_kv_seqlen[: bs + 1].to(dtype=torch.int32, device="cpu"),
+                torch.arange(
+                    batch.num_kv_indices + 1,
+                    batch.num_kv_indices + 1 + padded_bs - bs,
+                    dtype=torch.int32,
+                    device="cpu",
+                ),
             ]
         )  # (padded_bs + 1,)
 
         paged_kv_indices = torch.cat(
             [
-                torch.tensor(seq.kv_indices, dtype=torch.int32, device=self.device)
-                for seq in batch.seqs
+                batch.kv_indices[: batch.num_kv_indices].to(
+                    dtype=torch.int32, device=self.device
+                ),
+                torch.zeros((padded_bs - bs), dtype=torch.int32, device=self.device),
             ],
-            dim=0,
-        )  # (kv_len,)
+        )  # (kv_len + padded_bs - bs,)
 
         # Note: flashinfer requires last_page_len > 0:
         # "The last_page_len of each request must be greater than zero, and less than or equal to page_size."
@@ -269,19 +220,7 @@ class AttentionBackend:
         # -1 means invalid, should be skipped for cache update.
         # this is important for case where num_seqs < graph_bs
         output_kv_indices.fill_(-1)
-        output_kv_indices[:bs].copy_(
-            torch.cat(
-                [
-                    torch.tensor(
-                        seq.new_kv_indices,
-                        dtype=torch.long,
-                        device=self.device,
-                    )
-                    for seq in batch.seqs
-                ],
-                dim=0,
-            )
-        )
+        output_kv_indices[:bs] = batch.output_kv_indices[:bs]
 
         decode_wrapper = self.decode_wrappers_cuda_graph[padded_bs]
         decode_wrapper.plan(
@@ -307,8 +246,11 @@ class AttentionBackend:
 @dataclass
 class AttentionContext:
     attention_metadata: AttentionMetadata | None = None
+
+
 _attention_context = AttentionContext()
-    
+
+
 @contextmanager
 def attention_context(attention_metadata: AttentionMetadata):
     _attention_context.attention_metadata = attention_metadata

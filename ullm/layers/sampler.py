@@ -38,6 +38,7 @@ class Sampler(nn.Module):
         # Use in-place division to avoid creating a new tensor.
         logits = logits.to(torch.float)
         if temperatures is not None:
+            temperatures = torch.where(temperatures <= 0, 1.0, temperatures)
             logits.div_(temperatures.unsqueeze(dim=1))
 
         logits = _apply_top_k_top_p(logits, top_ps, top_ks)
@@ -60,10 +61,13 @@ def _apply_top_k_top_p(
 ) -> torch.Tensor:
     if p is None and k is None:
         return logits
+    
+    vocab_size = logits.size(-1)
 
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
+        k = torch.where(k <= 0, vocab_size, k)  # Ensure k is at least 1
         # Apply top-k.
         top_k_mask = logits_sort.size(1) - k.to(torch.long)
         # Get all the top_k values.
@@ -72,6 +76,7 @@ def _apply_top_k_top_p(
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
     if p is not None:
+        p = torch.where(p <= 0, 1.0, p)  # Ensure p is in (0, 1]
         # Apply top-p.
         probs_sort = logits_sort.softmax(dim=-1)
         probs_sum = probs_sort.cumsum(dim=-1)
