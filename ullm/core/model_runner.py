@@ -1,6 +1,5 @@
 import gc
 import os
-from dataclasses import dataclass
 
 import torch
 import tqdm
@@ -15,9 +14,10 @@ from ..layers.utils import IntermediateTensors
 from ..logger import init_logger
 from ..model_loader import load_model
 from ..models.registry import MODEL_REGISTRY
-from .common import ForwardBatch, ForwardMode
+from .common import ForwardMode, SchedulerOutput
 from .cuda_graph import CUDAGraphManager
 from .kv_cache import KVCachePool
+from .req_state import RequestState
 
 logger = init_logger(__name__)
 
@@ -73,15 +73,31 @@ def get_model_config_per_gpu(
     )
 
 
-@dataclass
 class ModelOutput:
-    output: torch.Tensor
-    copy_ready_event: torch.cuda.Event | None = None
+    def __init__(
+        self,
+        output: torch.Tensor,
+        copy_stream: torch.cuda.Stream | None = None,
+        copy_ready_event: torch.cuda.Event | None = None,
+    ):
+
+        self.copy_stream = copy_stream
+        self.copy_ready_event = copy_ready_event
+        if self.copy_stream is not None and self.copy_ready_event is not None:
+            self.output_gpu = output
+            self.output_cpu = torch.empty_like(output, device="cpu", pin_memory=True)
+            current_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(self.copy_stream):
+                self.copy_stream.wait_stream(current_stream)
+                self.output_cpu.copy_(self.output_gpu, non_blocking=True)
+                self.copy_ready_event.record(self.copy_stream)
+        else:
+            self.output_cpu = output.to("cpu")
 
     def get_output(self):
         if self.copy_ready_event is not None:
             self.copy_ready_event.synchronize()
-        return self.output
+        return self.output_cpu
 
 
 class ModelRunner:
@@ -134,6 +150,11 @@ class ModelRunner:
             device=self.device,
         )
 
+        self.req_state = RequestState(
+            max_bs=self.max_bs,
+            context_len=self.context_len,
+            device=self.device,
+        )
         # Initialize input batch buffer
         self.input_batch = InputBatch(
             max_bs=self.max_bs,
@@ -142,6 +163,11 @@ class ModelRunner:
             device=self.device,
         )
         self.intermediate_tensors: IntermediateTensors | None = None
+        self.output_copy_stream = torch.cuda.Stream(device=self.device)
+        self.output_copy_event = torch.cuda.Event()
+        # 标记 CPU Tensor 被消费，可以安全重用
+        self.input_copy_event = torch.cuda.Event()
+
         if not get_pp_group().is_last_rank:
             self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                 batch_size=self.max_bs,
@@ -228,14 +254,41 @@ class ModelRunner:
         torch.cuda.empty_cache()
         return max_num_tokens
 
+    def update_request_state(self, sched_output: SchedulerOutput):
+        for finished_seq_id in sched_output.finished_seq_ids:
+            self.req_state.remove_sequence(finished_seq_id)
+        for preempted_seq_id in sched_output.preempted_seq_ids:
+            self.req_state.remove_sequence(preempted_seq_id)
+
+        for scheduled_new_seq in sched_output.scheduled_new_seqs:
+            self.req_state.add_sequence(
+                scheduled_new_seq.seq_id,
+                scheduled_new_seq.token_ids,
+                scheduled_new_seq.cached_kv_indices,
+                scheduled_new_seq.new_kv_indices,
+            )
+        for scheduled_cached_seq in sched_output.scheduled_cached_seqs:
+            self.req_state.update_sequence(
+                scheduled_cached_seq.seq_id,
+                scheduled_cached_seq.new_token_ids,
+                scheduled_cached_seq.new_kv_indices,
+            )
+
+    def postprocess_request_state(self, output_ids: torch.Tensor):
+        # Update the request state with the newly generated token ids.
+        req_indices = self.input_batch.req_idx_mapping[: self.input_batch.bs]
+        self.req_state.last_sampled_token[req_indices] = output_ids
+
     def prepare_input(
         self,
-        batch: ForwardBatch,
+        sched_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ):
-        self.input_batch.apply_batch(batch)
-        if self.intermediate_tensors is not None:
-            assert intermediate_tensors is not None
+
+        self.input_batch.update_batch(sched_output, self.req_state)
+
+        if intermediate_tensors is not None:
+            assert self.intermediate_tensors is not None
             for name in self.intermediate_tensors.keys():
                 tensor = intermediate_tensors[name]
                 buffer = self.intermediate_tensors[name]
@@ -245,27 +298,33 @@ class ModelRunner:
     @torch.inference_mode()
     def execute_model(
         self,
-        batch: ForwardBatch,
+        sched_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelOutput | IntermediateTensors:
         assert hasattr(self, "model") and hasattr(self, "sampler"), (
             "Model and sampler must be loaded before execution."
         )
         assert hasattr(self, "kv_cache"), "KV Cache not initialized yet."
+
+        assert not (
+            sched_output.scheduled_new_seqs and sched_output.scheduled_cached_seqs
+        ), "Cannot have prefill sequences and decode sequences in the same batch."
+        # Prepare the intermediate tensors.
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
 
-        if batch.num_seqs == 0:
-            if get_pp_group().is_last_rank:
-                return ModelOutput(output=torch.empty((0,), device=self.device))
-            else:
-                return IntermediateTensors()
-        self.prepare_input(batch, intermediate_tensors)
+        # Ensure previous input batch is consumed before reusing
+        self.input_copy_event.synchronize()
+        self.update_request_state(sched_output)
+        self.prepare_input(sched_output, intermediate_tensors)
 
         # Forward pass
-        if self.cuda_graph is not None and batch.forward_mode == ForwardMode.DECODE:
+        if (
+            self.cuda_graph is not None
+            and self.input_batch.forward_mode == ForwardMode.DECODE
+        ):
             hidden_states = self._execute_model_cuda_graph()
         else:
             hidden_states = self._execute_model_eager()
@@ -290,7 +349,18 @@ class ModelRunner:
             self.input_batch.top_ks[: self.input_batch.bs],
         )
 
-        return ModelOutput(output=output_ids)
+        if not self.config.disable_async_scheduling:
+            model_output = ModelOutput(
+                output=output_ids,
+                copy_stream=self.output_copy_stream,
+                copy_ready_event=self.output_copy_event,
+            )
+        else:
+            model_output = ModelOutput(output=output_ids)
+
+        self.postprocess_request_state(output_ids)
+
+        return model_output
 
     def _execute_model_cuda_graph(self) -> torch.Tensor | IntermediateTensors:
         assert self.cuda_graph is not None and hasattr(self, "intermediate_tensors"), (
@@ -316,6 +386,9 @@ class ModelRunner:
             batch=self.input_batch,
             padded_bs=padded_bs,
         )
+        # Mark host-to-device input copies as complete before next host buffer reuse.
+        # input_batch 中有一些 cpu tensor 会在 build_metadata 阶段才被用到
+        self.input_copy_event.record(torch.cuda.current_stream())
 
         padded_hidden_states = graph_runner.replay(
             padded_input_ids, padded_positions, padded_intermediate_tensors
@@ -344,6 +417,8 @@ class ModelRunner:
             intermediate_tensors = None
 
         attention_metadata = self.attn_backend.build_metadata(batch=self.input_batch)
+        # Mark host-to-device input copies as complete before next host buffer reuse.
+        self.input_copy_event.record(torch.cuda.current_stream())
 
         with attention_context(attention_metadata):
             hidden_states = self.model(input_ids, positions, intermediate_tensors)

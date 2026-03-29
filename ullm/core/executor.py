@@ -137,6 +137,8 @@ def handle_rpc_request(worker: Worker, req: RpcRequest):
 
 def handle_rpc_response(req: RpcRequest, result: Any) -> RpcResponse:
     try:
+        if isinstance(result, Exception):
+            raise result
         if isinstance(req, RpcRequestExecuteModel):
             assert isinstance(result, ModelOutput | None)
             return RpcResponseExecuteModel(
@@ -153,8 +155,6 @@ def handle_rpc_response(req: RpcRequest, result: Any) -> RpcResponse:
             )
         elif isinstance(req, RpcRequestProfile):
             return RpcResponseNone(request_id=req.request_id)
-        elif isinstance(result, Exception):
-            raise result
         else:
             raise ValueError(f"Unknown method: {req.method_name}")
     except Exception as e:

@@ -16,7 +16,7 @@ from ..distributed import (
 )
 from ..layers.utils import IntermediateTensors
 from ..logger import init_logger
-from .common import ForwardBatch, ForwardMode, SchedulerOutput, Sequence
+from .common import SchedulerOutput, Sequence
 from .model_runner import ModelOutput, ModelRunner
 
 logger = init_logger(__name__)
@@ -105,55 +105,9 @@ class Worker:
     def initialize(self, gpu_memory_utilization: float):
         self.model_runner.initialize(gpu_memory_utilization)
 
-    def update_sequence_states(self, sched_output: SchedulerOutput) -> ForwardBatch:
-        for finished_seq_id in sched_output.finished_seq_ids:
-            if finished_seq_id in self.sequences:
-                del self.sequences[finished_seq_id]
-        for preempted_seq_id in sched_output.preempted_seq_ids:
-            if preempted_seq_id in self.sequences:
-                del self.sequences[preempted_seq_id]
-
-        prefill_batch = []
-        for scheduled_new_seq in sched_output.scheduled_new_seqs:
-            seq = scheduled_new_seq.to_sequence()
-            self.sequences[seq.seq_id] = seq
-            prefill_batch.append(seq)
-        decode_batch = []
-        for scheduled_cached_seq in sched_output.scheduled_cached_seqs:
-            seq = self.sequences[scheduled_cached_seq.seq_id]
-            scheduled_cached_seq.apply_updates(seq)
-            decode_batch.append(seq)
-
-        assert not (prefill_batch and decode_batch), (
-            "Cannot have both prefill and decode batches."
-        )
-        if prefill_batch:
-            return ForwardBatch(
-                forward_mode=ForwardMode.PREFILL,
-                num_seqs=len(prefill_batch),
-                seqs=prefill_batch,
-            )
-        else:
-            return ForwardBatch(
-                forward_mode=ForwardMode.DECODE,
-                num_seqs=len(decode_batch),
-                seqs=decode_batch,
-            )
-
-    def post_update_from_output(self, batch: ForwardBatch, input_ids: list[int]):
-        # 默认情况下，scheduler 的增量更新是延迟的，即在下一次调度时才更新 Worker 中的 sequence 状态。
-        # 但是当开启了异步调度时，一个 seq 的某些状态需要在 forward 后立即更新，即生成的新 token id。
-        # 这样每一次 forward 后，Worker 上的 sequence 状态都是最新的，下一次调度只需要 scheduler 提供一个新的 kv 索引即可。
-        if self.config.disable_async_scheduling:
-            return
-        for seq, new_token_id in zip(batch.seqs, input_ids):
-            # 在 worker 上即时更新 sequence 状态，因此不需要维护 num_placeholder_tokens 状态
-            seq.append_new_tokens([new_token_id])
-            seq.cache_new_kv_indices()
 
     def execute_model(self, sched_output: SchedulerOutput) -> ModelOutput | None:
         intermediate_tensors = None
-        batch = self.update_sequence_states(sched_output)
         if hasattr(self, "profiler") and self.profiler_started:
             self.profiler.step()
 
@@ -163,7 +117,7 @@ class Worker:
             )
             assert recv is not None
             intermediate_tensors = IntermediateTensors(recv)
-        output = self.model_runner.execute_model(batch, intermediate_tensors)
+        output = self.model_runner.execute_model(sched_output, intermediate_tensors)
         if not get_pp_group().is_last_rank:
             assert isinstance(output, IntermediateTensors)
             send_tensor_dict(
@@ -172,12 +126,7 @@ class Worker:
             return None
 
         assert isinstance(output, ModelOutput)
-        self.post_update_from_output(batch, output.get_output().tolist())
         return output
-
-        # output_ids = output.get_output().tolist()
-        # self.post_update_from_output(batch, output_ids)
-        # return output_ids
 
     def get_kv_cache_size(self) -> int:
         assert hasattr(self.model_runner, "kv_cache_size"), (

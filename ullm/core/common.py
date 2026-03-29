@@ -204,22 +204,11 @@ class ScheduledNewSequence:
         return ScheduledNewSequence(
             seq_id=seq.seq_id,
             sampling_params=seq.sampling_params,
-            token_ids=seq.token_ids,
+            # only send uncached tokens for prefill
+            token_ids=seq.token_ids[seq.num_cached_kv_indices :],
             cached_kv_indices=seq.cached_kv_indices,
             new_kv_indices=seq.new_kv_indices,
         )
-
-    def to_sequence(self) -> Sequence:
-        seq = Sequence(
-            seq_id=self.seq_id,
-            status=SequenceStatus.RUNNING,
-            token_ids=self.token_ids,
-            num_prompt_tokens=len(self.cached_kv_indices),
-            sampling_params=self.sampling_params,
-            cached_kv_indices=self.cached_kv_indices,
-            new_kv_indices=self.new_kv_indices,
-        )
-        return seq
 
 
 @dataclass
@@ -231,24 +220,16 @@ class ScheduledCachedSequence:
 
     @staticmethod
     def from_sequence(seq: Sequence) -> "ScheduledCachedSequence":
+        if seq.num_placeholder_tokens > 0:
+            new_token_ids = np.array([-1], dtype=np.int32)
+        else:
+            new_token_ids = seq.token_ids[-1:]
         return ScheduledCachedSequence(
             seq_id=seq.seq_id,
             sampling_params=seq.sampling_params,
-            new_token_ids=np.array([], dtype=np.int32)
-            if seq.num_placeholder_tokens > 0
-            else seq.token_ids[-1:],
+            new_token_ids=new_token_ids,
             new_kv_indices=seq.new_kv_indices[-1:],
         )
-
-    def apply_updates(self, seq: Sequence):
-        assert seq.seq_id == self.seq_id
-        seq.sampling_params = self.sampling_params
-        if seq.num_new_kv_indices > 0:
-            seq.cache_new_kv_indices()
-        if len(self.new_token_ids) > 0:
-            seq.append_new_tokens(self.new_token_ids.tolist())
-        if len(self.new_kv_indices) > 0:
-            seq.append_new_kv_indices(self.new_kv_indices.tolist())
 
 
 @dataclass

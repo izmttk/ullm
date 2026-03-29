@@ -63,12 +63,8 @@ class AttentionBackend:
         self,
         batch: InputBatch,
     ):
-        qo_indptr = batch.cu_seqlen[: batch.bs + 1].to(
-            dtype=torch.int32, device="cpu"
-        )  # (bs + 1,)
-        paged_kv_indptr = batch.cu_kv_seqlen[: batch.bs + 1].to(
-            dtype=torch.int32, device="cpu"
-        )  # (bs + 1,)
+        qo_indptr = batch.cu_seqlen_cpu[: batch.bs + 1].to(dtype=torch.int32) # (bs + 1,)
+        paged_kv_indptr = batch.cu_kv_seqlen_cpu[: batch.bs + 1].to(dtype=torch.int32) # (bs + 1,)
         paged_kv_last_page_len = torch.ones(
             batch.bs, dtype=torch.int32, device="cpu"
         )  # (bs,)
@@ -191,7 +187,7 @@ class AttentionBackend:
         # padding kv len will be set to 1
         paged_kv_indptr = torch.cat(
             [
-                batch.cu_kv_seqlen[: bs + 1].to(dtype=torch.int32, device="cpu"),
+                batch.cu_kv_seqlen_cpu[: bs + 1].to(dtype=torch.int32),
                 torch.arange(
                     batch.num_kv_indices + 1,
                     batch.num_kv_indices + 1 + padded_bs - bs,
