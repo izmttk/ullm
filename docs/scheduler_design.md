@@ -128,4 +128,4 @@ flowchart TB
 
 ## Async Scheduling
 
-WIP
+reference: [Fully Async Scheduling](./async_scheduling.md)

@@ -26,7 +26,7 @@
 - CUDA Graph 支持（仅 Decoding 阶段）
 - 增量调度和有状态的 Worker
 - Torch Profiler 支持
-- 异步调度（Async Scheduling）
+- 完全异步调度（Fully Async Scheduling）
 
 ## Requirements
 
@@ -154,7 +154,7 @@ Results:
 - [x] More Configurable Options
 - [x] Profiling
 - [x] Increamental Batch Scheduling and Stateful Workers
-- [x] Async Scheduling (Overlap Scheduling/Zero-Overhead Scheduling)
+- [x] Fully Async Scheduling (Overlap Scheduling/Zero-Overhead Scheduling)
 - [ ] Further Improvements based on Profiling
 - [ ] Benchmark Metrics on API Server
 
